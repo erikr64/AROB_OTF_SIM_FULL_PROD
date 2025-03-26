@@ -1,0 +1,42 @@
+-- create or replace task AOG_Orch_Simulation
+--     warehouse = INVENTORYMODEL_WH
+--     as begin
+
+-- call INVENTORYSANDBOX.DBO.Step_1_RFPGen_Simulation();
+-- call INVENTORYSANDBOX.DBO.Step_2_RFPGen_Simulation();
+-- call INVENTORYSANDBOX.DBO.Step_3_RFPGen_Simulation();
+-- call INVENTORYSANDBOX.DBO.Step_4_RFPGen_Simulation();
+-- execute task Step_5A_RFPGen_Simulation;
+
+-- END;
+
+
+
+create or replace task AOG_Orch_Simulation
+    warehouse = INVENTORYMODEL_WH
+    as begin
+
+call INVENTORYSANDBOX.DBO.Step_1B_RFPGen_Simulation();
+call INVENTORYSANDBOX.DBO.Step_2_RFPGen_Simulation();
+call INVENTORYSANDBOX.DBO.Step_3_RFPGen_Simulation();
+call INVENTORYSANDBOX.DBO.Step_4_RFPGen_Simulation();
+execute task INVENTORYSANDBOX.DBO.Step_5A_RFPGen_Simulation;
+
+END;
+
+--Step 6 will execute step 7A when required
+--Step 7A will trigger 7B
+--Step 7B will trigger AOG_DoSGen_Current which 
+--calls steps 8A, 8B, done
+
+create or replace task AOG_DoSGen_Simulation
+    warehouse = INVENTORYMODEL_WH
+    as begin
+
+call INVENTORYSANDBOX.DBO.Step_8A_RFPGen_Simulation();
+call INVENTORYSANDBOX.DBO.Step_8B_RFPGen_Simulation();
+call INVENTORYSANDBOX.DBO.Step_8C_RFPGen_Simulation();
+call INVENTORYSANDBOX.DBO.Step_8D_RFPGen_Simulation();
+execute task INVENTORYSANDBOX.DBO.RFP_GEN_POWERBI_DATASET;
+
+END;
