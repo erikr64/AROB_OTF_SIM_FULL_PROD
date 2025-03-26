@@ -1,5 +1,9 @@
+# UPDATE FROM TESTING -> CHANGE ALL .TEST ING to .DBO
+# DIFFERENCES FROM CURRENT:
+#     _Curr ent to _Simulation
+
 #Python Code Created by: Erik R
-#Code Last Updated: 1/8/2025
+#Code Last Updated: 3/26/2025 @12:15pm
 #Procedure Name: Step_4_RFPGen_Simulation
 #Code Guide Avail Here:
 #Procedure Operation:
@@ -9,7 +13,7 @@
 #To Do
 
 #Update Notes:
-#01/08/2025 - Updated IB optimization join given change to only include items in IB opt that are applicable with a constraint
+#Updated on 3/12 to remove filter for total FCs ordered >0 as that will filter future outputs
 
 import snowflake.snowpark as snowpark
 import numpy as np
@@ -26,226 +30,356 @@ def main(session: snowpark.Session):
     
 #Gather Order Information from Step 9 of IB Opt.
     InputData = """
-        With Total_FCCOUNT as (
-        Select Profit.SUPPLIERID, ORDERTYPE, SUM(FC_COUNT) as TOTAL_FCS_ORDERED
-        from inventorysandbox.dbo.RFP_ProfitVariable Profit
-        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT from inventorysandbox.dbo.RFP_ProfitVariable) MAXCOUNT
-        WHERE Profit.RFP_ITERATION_COUNT = MAX_COUNT
-        --AND SUPPLIERID = 365
-        GROUP BY Profit.SUPPLIERID, ORDERTYPE
+-- Select * from inventorysandbox.DBO.RFP_Simulation_ProfitVariable
+-- Select MAX(RFP_ITERATION_COUNT) from inventorysandbox.DBO.RFP_Simulation_ordering_sim --1B
+-- Select MAX(RFP_ITERATION_COUNT) from inventorysandbox.DBO.RFP_Simulation_IB_optimization --2A
+-- Select MAX(RFP_ITERATION_COUNT) from inventorysandbox.DBO.RFP_Simulation_OriginDecision --2B
+-- Select MAX(RFP_ITERATION_COUNT) from inventorysandbox.DBO.RFP_Simulation_IB_optimizationV2 --2C
+-- Select MAX(RFP_ITERATION_COUNT) from inventorysandbox.DBO.RFP_Simulation_IB_optimizationV3 --2D
+-- Select MAX(RFP_ITERATION_COUNT) from inventorysandbox.DBO.RFP_Simulation_ProfitVariable --3
+-- Select * from inventorysandbox.DBO.RFP_Simulation_ProfitVariable WHERE RFP_ITERATION_COUNT = 6
+
+
+
+
+With Constraint_Setup as (
+        Select
+            ITEMID,
+            SUPPLIERID,
+            CASE WHEN ORDER_TYPE = 'Domestic' THEN 'domestic' ELSE 'import' END as ORDERTYPE,
+            CASE WHEN C1 IS NOT NULL THEN 1 WHEN C2 IS NOT NULL THEN 1
+                WHEN C3 IS NOT NULL THEN 1 WHEN C4 IS NOT NULL THEN 1
+                WHEN C5 IS NOT NULL THEN 1 WHEN C6 IS NOT NULL THEN 1
+                WHEN C7 IS NOT NULL THEN 1 WHEN C8 IS NOT NULL THEN 1
+                WHEN C9 IS NOT NULL THEN 1 WHEN C10 IS NOT NULL THEN 1
+                WHEN C11 IS NOT NULL THEN 1 WHEN C12 IS NOT NULL THEN 1
+                WHEN C13 IS NOT NULL THEN 1 WHEN C14 IS NOT NULL THEN 1
+                WHEN C15 IS NOT NULL THEN 1 WHEN C16 IS NOT NULL THEN 1 ELSE NULL END as ANY_CONSTRAINT
+            -- IFNULL(C1,IFNULL(C2,IFNULL(C3,IFNULL(C4,IFNULL(C5,IFNULL(C6,IFNULL(C7,IFNULL(C8,IFNULL(C9,IFNULL(C10,IFNULL(C11,IFNULL(C12,IFNULL(C13,IFNULL(C14,IFNULL(C15,C16))))))))))))))) as ANY_CONSTRAINT
+        from INVENTORYSANDBOX.DBO.IB_CONSTRAINTS
         )
         
+        , NetworkOrder as (
+        Select
+            ITEMID,
+            UPDATED_ORDERTYPE,
+            OTF,
+            LT,
+            SUM(CAP_ORDERQTY_USED) as NetOrder
+        from inventorysandbox.DBO.RFP_Simulation_ordering_sim
+        GROUP BY ITEMID, UPDATED_ORDERTYPE, OTF, LT
+        HAVING SUM(CAP_ORDERQTY_USED) <= 0
+        )
+
+        ,Total_FCCOUNT as (
+        Select Profit.SUPPLIERID, ORDERTYPE, UPDATED_ORDERTYPE, SUM(FC_COUNT) as TOTAL_FCS_ORDERED
+        from inventorysandbox.DBO.RFP_Simulation_ProfitVariable Profit
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT from inventorysandbox.DBO.RFP_Simulation_ProfitVariable) MAXCOUNT
+        WHERE Profit.RFP_ITERATION_COUNT = MAX_COUNT
+        -- AND SUPPLIERID = 2133
+        GROUP BY Profit.SUPPLIERID, ORDERTYPE, UPDATED_ORDERTYPE
+        )
+
+        , OriginalOutput as (
         Select Profit.*,
         Total_FCCOUNT.TOTAL_FCS_ORDERED
-        from inventorysandbox.dbo.RFP_ProfitVariable Profit
-        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT from inventorysandbox.dbo.RFP_ProfitVariable) MAXCOUNT
-        LEFT JOIN Total_FCCOUNT on Total_FCCOUNT.SUPPLIERID = Profit.SUPPLIERID AND Total_FCCOUNT.ORDERTYPE = Profit.ORDERTYPE
+        from inventorysandbox.DBO.RFP_Simulation_ProfitVariable Profit
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT from inventorysandbox.DBO.RFP_Simulation_ProfitVariable) MAXCOUNT
+        LEFT JOIN Total_FCCOUNT on Total_FCCOUNT.SUPPLIERID = Profit.SUPPLIERID AND Total_FCCOUNT.UPDATED_ORDERTYPE = Profit.UPDATED_ORDERTYPE
         WHERE Profit.RFP_ITERATION_COUNT = MAX_COUNT
-        --AND Profit.SUPPLIERID = 386
+        --AND Profit.SUPPLIERID = 1243 --4334
+        )
+        
+        , ADDBACK as (
+        Select DISTINCT
+            sim.SUPPLIERID, sim.ORDERTYPE, sim.UPDATED_ORDERTYPE, sim.OTF,
+            sim.LT, sim.CAP_DOS, sim.ITERATION_COUNT, sim.RFP_ITERATION_COUNT,
+            null as BRAND_CUBEWEIGHTUNIT_TYPE, null as BRANDCUBE_TARGET, null as FC_COMBO_ORDERED, 0 as FC_COUNT,
+            0 as WAQTY, 0 as WACUBE, 0 as WAWEIGHT, 0 as NVQTY,
+            0 as NVCUBE, 0 as NVWEIGHT, 0 as NEQTY, 0 as NECUBE,
+            0 as NEWEIGHT, 0 as TXQTY, 0 as TXCUBE, 0 as TXWEIGHT,
+            0 as INQTY, 0 as INCUBE, 0 as INWEIGHT, 0 as PAQTY,
+            0 as PACUBE, 0 as PAWEIGHT, 0 as GAQTY, 0 as GACUBE,
+            0 as GAWEIGHT, 0 as WA_ORDERED, 0 as NV_ORDERED, 0 as NE_ORDERED,
+            0 as TX_ORDERED, 0 as IN_ORDERED, 0 as PA_ORDERED, 0 as GA_ORDERED,
+            null as FC_COMBO_OPTION, 0 as FC_COUNT_OPTION, null as WA_COVERFC, null as NV_COVERFC,
+            null as NE_COVERFC, null as TX_COVERFC, null as IN_COVERFC, null as PA_COVERFC,
+            null as GA_COVERFC, 0 as WA_QTY_COVERAGE, 0 as NV_QTY_COVERAGE, 0 as NE_QTY_COVERAGE,
+            0 as TX_QTY_COVERAGE, 0 as IN_QTY_COVERAGE, 0 as PA_QTY_COVERAGE, 0 as GA_QTY_COVERAGE,
+            0 as WA_CUBE_COVERAGE, 0 as NV_CUBE_COVERAGE, 0 as NE_CUBE_COVERAGE, 0 as TX_CUBE_COVERAGE,
+            0 as IN_CUBE_COVERAGE, 0 as PA_CUBE_COVERAGE, 0 as GA_CUBE_COVERAGE, 0 as WA_WEIGHT_COVERAGE,
+            0 as NV_WEIGHT_COVERAGE, 0 as NE_WEIGHT_COVERAGE, 0 as TX_WEIGHT_COVERAGE, 0 as IN_WEIGHT_COVERAGE,
+            0 as PA_WEIGHT_COVERAGE, 0 as GA_WEIGHT_COVERAGE, 0 as WAQTY_OPTION, 0 as NVQTY_OPTION,
+            0 as NEQTY_OPTION, 0 as TXQTY_OPTION, 0 as INQTY_OPTION, 0 as PAQTY_OPTION,
+            0 as GAQTY_OPTION, 0 as WACUBE_OPTION, 0 as NVCUBE_OPTION, 0 as NECUBE_OPTION,
+            0 as TXCUBE_OPTION, 0 as INCUBE_OPTION, 0 as PACUBE_OPTION, 0 as GACUBE_OPTION,
+            0 as WAWEIGHT_OPTION, 0 as NVWEIGHT_OPTION, 0 as NEWEIGHT_OPTION, 0 as TXWEIGHT_OPTION,
+            0 as INWEIGHT_OPTION, 0 as PAWEIGHT_OPTION, 0 as GAWEIGHT_OPTION, 0 as TOTAL_CUBE_NETWORK,
+            0 as WA_FTL_OR_40FT_COUNT, 0 as NV_FTL_OR_40FT_COUNT, 0 as NE_FTL_OR_40FT_COUNT, 0 as TX_FTL_OR_40FT_COUNT,
+            0 as IN_FTL_OR_40FT_COUNT, 0 as PA_FTL_OR_40FT_COUNT, 0 as GA_FTL_OR_40FT_COUNT, 0 as WA_PTL_OR_20FT_COUNT,
+            0 as NV_PTL_OR_20FT_COUNT, 0 as NE_PTL_OR_20FT_COUNT, 0 as TX_PTL_OR_20FT_COUNT, 0 as IN_PTL_OR_20FT_COUNT,
+            0 as PA_PTL_OR_20FT_COUNT, 0 as GA_PTL_OR_20FT_COUNT, 0 as WA_LTL_COUNT, 0 as NV_LTL_COUNT,
+            0 as NE_LTL_COUNT, 0 as TX_LTL_COUNT, 0 as IN_LTL_COUNT, 0 as PA_LTL_COUNT,
+            0 as GA_LTL_COUNT, 0 as WA_SP_COUNT, 0 as NV_SP_COUNT, 0 as NE_SP_COUNT,
+            0 as TX_SP_COUNT, 0 as IN_SP_COUNT, 0 as PA_SP_COUNT, 0 as GA_SP_COUNT,
+            null as ORIGIN, 0 as WA_FREIGHT_COST, 0 as NV_FREIGHT_COST, 0 as NE_FREIGHT_COST,
+            0 as TX_FREIGHT_COST, 0 as IN_FREIGHT_COST, 0 as PA_FREIGHT_COST, 0 as GA_FREIGHT_COST,
+            0 as Total_Freight_Cost, 0 as SCENARIO_ADD_COST_OBSHIP, 0 as NETWORK_TOTALCOST, 0 as SCENARIO_OOS_LOST_MARGIN,
+            0 as HOLDING_COST_ADD, null as TOTAL_SOLCOST, current_date() as LASTMODIFIED,
+            Total_FCCOUNT.TOTAL_FCS_ORDERED as TOTAL_FCS_ORDERED
+        from inventorysandbox.DBO.RFP_Simulation_ordering_sim sim
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT prod on prod.ITEMID = sim.ITEMID
+        LEFT JOIN Constraint_Setup CON_ITEM ON CON_ITEM.ITEMID = sim.ITEMID AND CON_ITEM.ORDERTYPE = sim.ordertype
+        LEFT JOIN Constraint_Setup CON_BRAND ON CON_BRAND.SUPPLIERID = sim.SUPPLIERID AND CON_BRAND.ORDERTYPE = sim.ordertype AND CON_BRAND.ITEMID IS NULL
+        LEFT JOIN NetworkOrder on NetworkOrder.ITEMID = sim.ITEMID AND NetworkOrder.UPDATED_ORDERTYPE = sim.updated_ordertype AND NetworkOrder.OTF = sim.OTF AND NetworkOrder.LT = sim.LT
+        LEFT JOIN Total_FCCOUNT on Total_FCCOUNT.SUPPLIERID = sim.SUPPLIERID AND Total_FCCOUNT.UPDATED_ORDERTYPE = sim.UPDATED_ORDERTYPE
+        INNER JOIN (Select MAX(RFP_ITERATION_COUNT) as MAXCOUNT from inventorysandbox.DBO.RFP_Simulation_IB_optimizationV2) MAXCOUNT on MAXCOUNT.MAXCOUNT = sim.RFP_ITERATION_COUNT
+
+        LEFT JOIN OriginalOutput on OriginalOutput.SUPPLIERID = sim.SUPPLIERID AND OriginalOutput.ORDERTYPE = sim.ORDERTYPE AND OriginalOutput.UPDATED_ORDERTYPE = sim.UPDATED_ORDERTYPE AND OriginalOutput.OTF = sim.OTF 
+            AND OriginalOutput.LT = sim.LT AND OriginalOutput.CAP_DOS = sim.CAP_DOS AND OriginalOutput.RFP_ITERATION_COUNT = sim.RFP_ITERATION_COUNT
+
+        WHERE OriginalOutput.SUPPLIERID IS NULL
+        -- AND sim.supplierid = 555
+        -- WHERE (CON_ITEM.ANY_CONSTRAINT IS NULL AND CON_BRAND.ANY_CONSTRAINT IS NULL)
+        -- WHERE sim.supplierid = 555
+        -- AND NetworkOrder.ITEMID IS NOT NULL
+        )
+
+        , FinalOutputV1 as (
+        Select * from ADDBACK
+        UNION ALL
+        Select * from OriginalOutput
+        )
+
+        , FinalOutputV2 as (
+        Select 
+            FinalOutputV1.*,
+            rank() OVER (PARTITION BY SUPPLIERID, UPDATED_ORDERTYPE, OTF, RFP_ITERATION_COUNT ORDER BY BRANDCUBE_TARGET ASC) as EntryRank
+        from FinalOutputV1
+        -- WHERE SUPPLIERID = 555
+        )
+        Select * from FinalOutputV2 WHERE EntryRank = 1
                    """
     df_InputData = session.sql(InputData)
     df_InputData = df_InputData.to_pandas()
-
-    df_InputData['Total_SolCost_Used'] = np.where(df_InputData['NETWORK_TOTALCOST'] == 0, 0, df_InputData['Total_SolCost'] / df_InputData['NETWORK_TOTALCOST'])
-    df_InputData['Total_SolCost_rand'] = np.where(df_InputData['Total_SolCost_Used'] == 0, 9999, df_InputData['Total_SolCost_Used']) #+ df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
     
-    df_InputData['SOLUTION_RANK_ITERATION'] = np.where((df_InputData['TOTAL_FCS_ORDERED'] == 0) & (df_InputData['OTF'] == 21), 1,
-                                                       np.where(df_InputData['Total_SolCost_rand'] == 9999, 99, df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'ITERATION_COUNT'])['Total_SolCost_rand'].rank(method='dense', ascending=True)))
+    # df_InputData['TOTAL_SOLCOST'].fillna(99999999, inplace=True)
+    #Replace blank total network cost with 0?
+    df_InputData['TOTAL_SOLCOST_Used'] = np.where(df_InputData['NETWORK_TOTALCOST'] == 0, df_InputData['TOTAL_SOLCOST'], df_InputData['TOTAL_SOLCOST'] / df_InputData['NETWORK_TOTALCOST'])
+    df_InputData['TOTAL_SOLCOST_rand'] = np.where(df_InputData['TOTAL_SOLCOST_Used'] == 0, 0, df_InputData['TOTAL_SOLCOST_Used']) #+ df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
 
-    df_InputData = df_InputData[df_InputData['SOLUTION_RANK_ITERATION'] == 1]
+    #Removed section from below for current model, this should only apply for simulation model: np.where((df_InputData['TOTAL_FCS_ORDERED'] == 0) & (df_InputData['OTF'] == 21), 1,
 
-    df_InputData['SOLUTION_RANK_FINAL'] = np.where((df_InputData['TOTAL_FCS_ORDERED'] == 0) & (df_InputData['OTF'] == 21), 1,
-                                                   np.where(df_InputData['Total_SolCost_rand'] == 0, 99, df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE'])['Total_SolCost_rand'].rank(method='dense', ascending=True)))
+#Added 3/19 to account for multiple origins
+    df_InputData['TOTAL_FCS_ORDERED'].fillna(0, inplace=True)
+    df_InputData['NETWORK_TOTALCOST'].fillna(0, inplace=True)
+    df_InputData['TOTAL_SOLCOST'].fillna(0, inplace=True)
 
-    df_InputData = df_InputData.drop(columns=['TOTAL_FCS_ORDERED'])
-    df_InputData = df_InputData[df_InputData['SOLUTION_RANK_FINAL'] == 1]
+    df_InputData['TOTAL_SOLCOST_rand'].fillna(9999999999 + (df_InputData['OTF'] / 1000), inplace=True)
+    
+    df_InputData['TOTAL_SOLCOST_OTF'] = df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'RFP_ITERATION_COUNT', 'OTF'])['TOTAL_SOLCOST'].transform('sum')
+    # df_InputData['TOTAL_SOLCOST_FC_COMBO'] = df_InputData.groupby(['SUPPLIERID', 'UPDATED_ORDERTYPE', 'RFP_ITERATION_COUNT', 'FC_COMBO_OPTION'])['TOTAL_SOLCOST'].transform('sum')
+    df_InputData['TOTAL_SOLCOST_OTF_USED'] = np.where(df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'RFP_ITERATION_COUNT', 'OTF'])['NETWORK_TOTALCOST'].transform('sum') == 0, 
+                                                      np.where(df_InputData['TOTAL_SOLCOST_OTF'] == 0, 999999999 + (df_InputData['OTF'] / 1000), df_InputData['TOTAL_SOLCOST_OTF']),
+                                                      df_InputData['TOTAL_SOLCOST_OTF'] / df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'RFP_ITERATION_COUNT', 'OTF'])['NETWORK_TOTALCOST'].transform('sum'))
+    # df_InputData['TOTAL_SOLCOST_FC_COMBO_USED'] = df_InputData['TOTAL_SOLCOST_FC_COMBO'] / df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'RFP_ITERATION_COUNT', 'FC_COMBO_OPTION'])['NETWORK_TOTALCOST'].transform('sum')
+
+    # df_InputData['SOLUTION_RANK_OTF'] = np.where((df_InputData['TOTAL_FCS_ORDERED'] == 0) & (df_InputData['OTF'] == 21), 1, np.where(df_InputData['TOTAL_FCS_ORDERED'] == 0, 99,
+    #                                             np.where(df_InputData['TOTAL_SOLCOST_rand'] == 0, 99, df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'RFP_ITERATION_COUNT'])['TOTAL_SOLCOST_OTF_USED'].rank(method='dense', ascending=True))))
+
+    df_InputData['SOLUTION_RANK_OTF'] = df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'RFP_ITERATION_COUNT'])['TOTAL_SOLCOST_OTF_USED'].rank(method='dense', ascending=True)
+    
+    df_InputData['SOLUTION_RANK_FC_COMBO'] = df_InputData.groupby(['SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF'])['TOTAL_SOLCOST_rand'].rank(method='dense', ascending=True)
+
+    
+#End of Added 3/19
+    
+    # df_InputData['SOLUTION_RANK_ITERATION'] = np.where((df_InputData['TOTAL_FCS_ORDERED'] == 0) & (df_InputData['OTF'] == 21), 1, np.where(df_InputData['TOTAL_FCS_ORDERED'] == 0, 99,
+    #                                                    np.where(df_InputData['TOTAL_SOLCOST_rand'] == 0, 99, df_InputData.groupby(['SUPPLIERID', 'UPDATED_ORDERTYPE', 'ITERATION_COUNT'])['TOTAL_SOLCOST_rand'].rank(method='dense', ascending=True))))
+
+    # df_InputData['SOLUTION_RANK_ITERATION'].fillna(1, inplace=True)
+    df_InputData = df_InputData[df_InputData['SOLUTION_RANK_OTF'] == 1]
+
+    # df_InputData['SOLUTION_RANK_FC_COMBO'] = np.where((df_InputData['TOTAL_FCS_ORDERED'] == 0) & (df_InputData['OTF'] == 21), 1, np.where(df_InputData['TOTAL_FCS_ORDERED'] == 0, 99,
+    #                                                np.where(df_InputData['TOTAL_SOLCOST_rand'] == 0, 99, df_InputData.groupby(['SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF'])['TOTAL_SOLCOST_rand'].rank(method='dense', ascending=True))))
+
+    # df_InputData = df_InputData.drop(columns=['TOTAL_FCS_ORDERED'])
+    # df_InputData['SOLUTION_RANK_FC_COMBO'].fillna(99, inplace=True)
+    # df_InputData = df_InputData[df_InputData['FC_COUNT'] > 0]
+    df_InputData = df_InputData[df_InputData['SOLUTION_RANK_FC_COMBO'] == 1]
     #df_InputData['RFP_ITERATION_COUNT'] = 1
         #Optional - View Output   
-    # df_InputData = session.create_dataframe(df_InputData)
-    # return df_InputData#.filter(col("SUPPLIERID") == '1688');
+    
+    # session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_OrderDecision_TestTemp')
 
  #Start of New Code
 
 
     #Query Baseline Order Data
-    # InputData_Orig = 'inventorysandbox.dbo.RFP_IB_optimization'
     InputData_Orig = """
-With FIFOCOST as (
-        Select Fifo.* from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE Fifo
-        INNER JOIN (Select ITEMID, max(DM_UPDATEDON) as MaxDate from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE GROUP BY ITEMID) as MaxDate on MaxDate.MaxDate = Fifo.DM_UPDATEDON AND MaxDate.ITEMID = Fifo.ITEMID
-        --Where ITEMID = 243726
-)
-
-, NonIBOpt as (
-        Select 
-            sim.ITEMID,
-            sim.SUPPLIERID,
-            sim.FC,
-            sim.FC as FC_CODE,
-            sim.ORDERTYPE,
-            sim.OTF,
-            sim.LT,
-            sim.CAP_DOS,
-            sim.ITERATION_COUNT,
-            sim.RFP_ITERATION_COUNT,
-            sim.CAP_ORDERQTY_USED as Output_Original,
-            FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OriginalCost,
-            0 as FC_Limited,
-            0 as Redistribution_Qty,
-            sim.CAP_ORDERQTY_USED as Output_Redistributed,
-            FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_RedistributedCost,
-            sim.CASEQUANTITY,
-            prod.ITEMCUBE,
-            FIFOCOST.FIFOAVERAGECOST,
-            0 as Item_Constraint_Used,
-            NULL as Item_MOQMOV_Type,
-            0 as Redistribution_Qty_ItemMOQ,
-            0 as Constraint_Total_Applicable,
-            0 as Roundup_ItemMOQ,
-            sim.CAP_ORDERQTY_USED as Output_OrderQty_ItemMOQ,
-            FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OrderCost_ItemMOQ,
-            'Round' as Case_RoundType,
-            (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundQty,
-            FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundCost,
-            NULL as Item_Pallet_Type,
-            1 as Item_Pallet_Constraint,
-            0 as Item_Pallet_TotalRound,
-            (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletQty,
-            FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletCost,
-            'None' as Brand_MOV_Type,
-            0 as Brand_MOV_Used,
-            0 as MOV_RoundUnits,
-            0 as MOV_ReqRoundAdd_Pallet,
-            (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVQty,
-            FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVCost,
-            sim."Last Modified"
-        from inventorysandbox.dbo.RFP_ordering_sim sim
-        LEFT JOIN inventorysandbox.dbo.RFP_IB_optimization IBOpt on IBOpt.itemid = sim.itemid AND IBOpt.fc = sim.fc AND 
-            IBOpt.rfp_iteration_count = sim.rfp_iteration_count AND IBOPT.ordertype = sim.ordertype AND IBOPT.otf = sim.otf AND IBOPT.lt = sim.lt
-        LEFT JOIN FIFOCOST on FIFOCOST.itemid = sim.itemid
-        LEFT JOIN lakehouse.spreedw_dim.product prod on prod.itemid = sim.itemid
-        INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = sim.rfp_iteration_count
-        WHERE IBOpt.ITEMID IS NULL
-)
-
-        Select Opt.* from inventorysandbox.dbo.RFP_IB_optimization Opt INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = Opt.rfp_iteration_count
-        UNION
-        Select * from NonIBOpt
+        Select V3.*,
+        "Output_BrandCubeQty" as ORDERQTY_USE 
+        from inventorysandbox.DBO.RFP_Simulation_IB_optimizationV3 V3
                    """
     df_InputData_Orig = session.sql(InputData_Orig)
-    # df_InputData_Orig = session.table(InputData_Orig)#.filter(col("SUPPLIERID") == '1326')
     df_InputData_Orig = df_InputData_Orig.to_pandas()
-    df_InputData_Orig = pd.DataFrame(df_InputData_Orig)
+    
+    # InputData_Orig = 'inventorysandbox.DBO.RFP_Simulation_IB_optimizationV3'
+    # df_InputData_Orig = session.table(InputData_Orig)#.filter(col("SUPPLIERID") == '1326')
+    # df_InputData_Orig = df_InputData_Orig.to_pandas()
+    # df_InputData_Orig = pd.DataFrame(df_InputData_Orig)
     
     df_InputData_Orig['ORDERTYPE'] = np.where(df_InputData_Orig['ORDERTYPE'] == 'Import', 'import', np.where(df_InputData_Orig['ORDERTYPE'] == 'Domestic', 'domestic', df_InputData_Orig['ORDERTYPE']))
-    df_InputData = pd.merge(df_InputData_Orig, df_InputData, how='inner', on=['SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT'])
+    
+    df_InputData = pd.merge(df_InputData_Orig, df_InputData, how='inner', on=['SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT'])
+
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == '263132');
     
     #Generate Order Qty by FC
-    WA_ItemOrderQty = df_InputData[df_InputData['FC'] == 'WA']
-    WA_ItemOrderQty = WA_ItemOrderQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL', 'Output_BrandMOVQty']]
-    WA_ItemOrderQty = WA_ItemOrderQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'], as_index=False).sum() 
-    WA_ItemOrderQty = WA_ItemOrderQty.rename(columns={'Output_BrandMOVQty': 'WA_ItemOrderQty'})
+    WA_ITEMORDERQTY = df_InputData[df_InputData['FC'] == 'WA']
+    WA_ITEMORDERQTY = WA_ITEMORDERQTY[['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO', 'ORDERQTY_USE']]
+    WA_ITEMORDERQTY = WA_ITEMORDERQTY.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'], as_index=False).sum() 
+    WA_ITEMORDERQTY = WA_ITEMORDERQTY.rename(columns={'ORDERQTY_USE': 'WA_ITEMORDERQTY'})
     
-    NV_ItemOrderQty = df_InputData[df_InputData['FC'] == 'NV']
-    NV_ItemOrderQty = NV_ItemOrderQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL', 'Output_BrandMOVQty']]
-    NV_ItemOrderQty = NV_ItemOrderQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'], as_index=False).sum() 
-    NV_ItemOrderQty = NV_ItemOrderQty.rename(columns={'Output_BrandMOVQty': 'NV_ItemOrderQty'})
+    NV_ITEMORDERQTY = df_InputData[df_InputData['FC'] == 'NV']
+    NV_ITEMORDERQTY = NV_ITEMORDERQTY[['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO', 'ORDERQTY_USE']]
+    NV_ITEMORDERQTY = NV_ITEMORDERQTY.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'], as_index=False).sum() 
+    NV_ITEMORDERQTY = NV_ITEMORDERQTY.rename(columns={'ORDERQTY_USE': 'NV_ITEMORDERQTY'})
     
-    NE_ItemOrderQty = df_InputData[df_InputData['FC'] == 'NE']
-    NE_ItemOrderQty = NE_ItemOrderQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL', 'Output_BrandMOVQty']]
-    NE_ItemOrderQty = NE_ItemOrderQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'], as_index=False).sum() 
-    NE_ItemOrderQty = NE_ItemOrderQty.rename(columns={'Output_BrandMOVQty': 'NE_ItemOrderQty'})
+    NE_ITEMORDERQTY = df_InputData[df_InputData['FC'] == 'NE']
+    NE_ITEMORDERQTY = NE_ITEMORDERQTY[['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO', 'ORDERQTY_USE']]
+    NE_ITEMORDERQTY = NE_ITEMORDERQTY.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'], as_index=False).sum() 
+    NE_ITEMORDERQTY = NE_ITEMORDERQTY.rename(columns={'ORDERQTY_USE': 'NE_ITEMORDERQTY'})
     
-    TX_ItemOrderQty = df_InputData[df_InputData['FC'] == 'TX']
-    TX_ItemOrderQty = TX_ItemOrderQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL', 'Output_BrandMOVQty']]
-    TX_ItemOrderQty = TX_ItemOrderQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'], as_index=False).sum() 
-    TX_ItemOrderQty = TX_ItemOrderQty.rename(columns={'Output_BrandMOVQty': 'TX_ItemOrderQty'})
+    TX_ITEMORDERQTY = df_InputData[df_InputData['FC'] == 'TX']
+    TX_ITEMORDERQTY = TX_ITEMORDERQTY[['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO', 'ORDERQTY_USE']]
+    TX_ITEMORDERQTY = TX_ITEMORDERQTY.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'], as_index=False).sum() 
+    TX_ITEMORDERQTY = TX_ITEMORDERQTY.rename(columns={'ORDERQTY_USE': 'TX_ITEMORDERQTY'})
     
-    IN_ItemOrderQty = df_InputData[df_InputData['FC'] == 'IN']
-    IN_ItemOrderQty = IN_ItemOrderQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL', 'Output_BrandMOVQty']]
-    IN_ItemOrderQty = IN_ItemOrderQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'], as_index=False).sum() 
-    IN_ItemOrderQty = IN_ItemOrderQty.rename(columns={'Output_BrandMOVQty': 'IN_ItemOrderQty'})
+    IN_ITEMORDERQTY = df_InputData[df_InputData['FC'] == 'IN']
+    IN_ITEMORDERQTY = IN_ITEMORDERQTY[['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO', 'ORDERQTY_USE']]
+    IN_ITEMORDERQTY = IN_ITEMORDERQTY.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'], as_index=False).sum() 
+    IN_ITEMORDERQTY = IN_ITEMORDERQTY.rename(columns={'ORDERQTY_USE': 'IN_ITEMORDERQTY'})
     
-    PA_ItemOrderQty = df_InputData[df_InputData['FC'] == 'PA']
-    PA_ItemOrderQty = PA_ItemOrderQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL', 'Output_BrandMOVQty']]
-    PA_ItemOrderQty = PA_ItemOrderQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'], as_index=False).sum() 
-    PA_ItemOrderQty = PA_ItemOrderQty.rename(columns={'Output_BrandMOVQty': 'PA_ItemOrderQty'})
+    PA_ITEMORDERQTY = df_InputData[df_InputData['FC'] == 'PA']
+    PA_ITEMORDERQTY = PA_ITEMORDERQTY[['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO', 'ORDERQTY_USE']]
+    PA_ITEMORDERQTY = PA_ITEMORDERQTY.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'], as_index=False).sum() 
+    PA_ITEMORDERQTY = PA_ITEMORDERQTY.rename(columns={'ORDERQTY_USE': 'PA_ITEMORDERQTY'})
     
-    GA_ItemOrderQty = df_InputData[df_InputData['FC'] == 'GA']
-    GA_ItemOrderQty = GA_ItemOrderQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL', 'Output_BrandMOVQty']]
-    GA_ItemOrderQty = GA_ItemOrderQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'], as_index=False).sum() 
-    GA_ItemOrderQty = GA_ItemOrderQty.rename(columns={'Output_BrandMOVQty': 'GA_ItemOrderQty'})
+    GA_ITEMORDERQTY = df_InputData[df_InputData['FC'] == 'GA']
+    GA_ITEMORDERQTY = GA_ITEMORDERQTY[['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO', 'ORDERQTY_USE']]
+    GA_ITEMORDERQTY = GA_ITEMORDERQTY.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'], as_index=False).sum() 
+    GA_ITEMORDERQTY = GA_ITEMORDERQTY.rename(columns={'ORDERQTY_USE': 'GA_ITEMORDERQTY'})
+
+    # df_InputData = df_InputData.drop(columns=['WA_COVERFC', 'NV_COVERFC', 'NE_COVERFC', 'TX_COVERFC', 'IN_COVERFC', 'PA_COVERFC', 'GA_COVERFC'])
     
-    df_InputData = pd.merge(df_InputData, WA_ItemOrderQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'])
-    df_InputData = pd.merge(df_InputData, NV_ItemOrderQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'])
-    df_InputData = pd.merge(df_InputData, NE_ItemOrderQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'])
-    df_InputData = pd.merge(df_InputData, TX_ItemOrderQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'])
-    df_InputData = pd.merge(df_InputData, IN_ItemOrderQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'])
-    df_InputData = pd.merge(df_InputData, PA_ItemOrderQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'])
-    df_InputData = pd.merge(df_InputData, GA_ItemOrderQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FINAL'])
+    df_InputData = pd.merge(df_InputData, WA_ITEMORDERQTY, how='left', on=['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'])
+    df_InputData = pd.merge(df_InputData, NV_ITEMORDERQTY, how='left', on=['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'])
+    df_InputData = pd.merge(df_InputData, NE_ITEMORDERQTY, how='left', on=['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'])
+    df_InputData = pd.merge(df_InputData, TX_ITEMORDERQTY, how='left', on=['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'])
+    df_InputData = pd.merge(df_InputData, IN_ITEMORDERQTY, how='left', on=['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'])
+    df_InputData = pd.merge(df_InputData, PA_ITEMORDERQTY, how='left', on=['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'])
+    df_InputData = pd.merge(df_InputData, GA_ITEMORDERQTY, how='left', on=['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SOLUTION_RANK_FC_COMBO'])
+
+    df_InputData['WA_ITEMORDERQTY'].fillna(0, inplace=True)
+    df_InputData['NV_ITEMORDERQTY'].fillna(0, inplace=True)
+    df_InputData['NE_ITEMORDERQTY'].fillna(0, inplace=True)
+    df_InputData['TX_ITEMORDERQTY'].fillna(0, inplace=True)
+    df_InputData['IN_ITEMORDERQTY'].fillna(0, inplace=True)
+    df_InputData['PA_ITEMORDERQTY'].fillna(0, inplace=True)
+    df_InputData['GA_ITEMORDERQTY'].fillna(0, inplace=True)
+
+    # session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_OrderDecision_TestTemp') #Final Aggregation should happen at the order type level
+    # Need to aggregate the values back to a single row, assign the correct cover FC and then rejoin
+
+    # df_InputData['PA_TOTALCOVERAGE'] = df_InputData[df_InputData['WA_COVERFC'] == 'PA'].groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['WA_ITEMORDERQTY'].transform('max')
     
-    del WA_ItemOrderQty
-    del NV_ItemOrderQty
-    del NE_ItemOrderQty
-    del TX_ItemOrderQty
-    del IN_ItemOrderQty
-    del PA_ItemOrderQty
-    del GA_ItemOrderQty
+    
+    del WA_ITEMORDERQTY
+    del NV_ITEMORDERQTY
+    del NE_ITEMORDERQTY
+    del TX_ITEMORDERQTY
+    del IN_ITEMORDERQTY
+    del PA_ITEMORDERQTY
+    del GA_ITEMORDERQTY
     
     #Allocate Order Qty
-    df_InputData['Output_FreightOptQty'] = np.where(df_InputData['FC'] == df_InputData['WA_COVERFC'], df_InputData['WA_ItemOrderQty'], 0) + np.where(df_InputData['FC'] == df_InputData['NV_COVERFC'], df_InputData['NV_ItemOrderQty'], 0) + np.where(df_InputData['FC'] == df_InputData['NE_COVERFC'], df_InputData['NE_ItemOrderQty'], 0) + np.where(df_InputData['FC'] == df_InputData['TX_COVERFC'], df_InputData['TX_ItemOrderQty'], 0) + np.where(df_InputData['FC'] == df_InputData['IN_COVERFC'], df_InputData['IN_ItemOrderQty'], 0) + np.where(df_InputData['FC'] == df_InputData['PA_COVERFC'], df_InputData['PA_ItemOrderQty'], 0) + np.where(df_InputData['FC'] == df_InputData['GA_COVERFC'], df_InputData['GA_ItemOrderQty'], 0)
+    df_InputData['Output_FreightOptQty'] = np.where(df_InputData['FC'] == df_InputData['WA_COVERFC'], df_InputData['WA_ITEMORDERQTY'], 0) + np.where(df_InputData['FC'] == df_InputData['NV_COVERFC'], df_InputData['NV_ITEMORDERQTY'], 0) + np.where(df_InputData['FC'] == df_InputData['NE_COVERFC'], df_InputData['NE_ITEMORDERQTY'], 0) + np.where(df_InputData['FC'] == df_InputData['TX_COVERFC'], df_InputData['TX_ITEMORDERQTY'], 0) + np.where(df_InputData['FC'] == df_InputData['IN_COVERFC'], df_InputData['IN_ITEMORDERQTY'], 0) + np.where(df_InputData['FC'] == df_InputData['PA_COVERFC'], df_InputData['PA_ITEMORDERQTY'], 0) + np.where(df_InputData['FC'] == df_InputData['GA_COVERFC'], df_InputData['GA_ITEMORDERQTY'], 0)
+    
     df_InputData['Output_FreightOptCost'] = df_InputData['Output_FreightOptQty'] * df_InputData['FIFOAVERAGECOST']
     df_InputData['Output_FreightOptCube'] = df_InputData['Output_FreightOptQty'] * df_InputData['ITEMCUBE']
     #df_InputData['Output_FreightOptWeight'] = df_InputData['Output_FreightOptQty'] * df_InputData['Item_Weight']
     df_InputData['FrghtOpt_FCRedist_To'] = np.where(df_InputData['FC'] == 'WA', df_InputData['WA_COVERFC'], np.where(df_InputData['FC'] == 'NV', df_InputData['NV_COVERFC'], np.where(df_InputData['FC'] == 'NE', df_InputData['NE_COVERFC'],
                                              np.where(df_InputData['FC'] == 'TX', df_InputData['TX_COVERFC'], np.where(df_InputData['FC'] == 'IN', df_InputData['IN_COVERFC'], np.where(df_InputData['FC'] == 'PA', df_InputData['PA_COVERFC'], np.where(df_InputData['FC'] == 'GA', df_InputData['GA_COVERFC'], '')))))))
+    df_InputData['Last Modified']= datetime.now()
     
     #Drop Unused Column
     df_InputData = df_InputData.drop(columns=['WA_COVERFC', 'NV_COVERFC', 'NE_COVERFC', 'TX_COVERFC', 'IN_COVERFC', 'PA_COVERFC', 'GA_COVERFC'])
-    df_InputData = df_InputData.drop(columns=['Last Modified', 'WA_ItemOrderQty', 'NV_ItemOrderQty', 'NE_ItemOrderQty', 'TX_ItemOrderQty', 'IN_ItemOrderQty', 'PA_ItemOrderQty', 'GA_ItemOrderQty'])
-    df_InputData = df_InputData.drop(columns=['WA_Freight_Cost', 'NV_Freight_Cost', 'NE_Freight_Cost', 'TX_Freight_Cost', 'IN_Freight_Cost', 'PA_Freight_Cost', 'GA_Freight_Cost'])
-    df_InputData = df_InputData.drop(columns=['WA_SP_Count', 'NV_SP_Count', 'NE_SP_Count', 'TX_SP_Count', 'IN_SP_Count', 'PA_SP_Count', 'GA_SP_Count'])
-    df_InputData = df_InputData.drop(columns=['WA_LTL_Count', 'NV_LTL_Count', 'NE_LTL_Count', 'TX_LTL_Count', 'IN_LTL_Count', 'PA_LTL_Count', 'GA_LTL_Count'])
-    df_InputData = df_InputData.drop(columns=['WA_PTL_or_20ft_Count', 'NV_PTL_or_20ft_Count', 'NE_PTL_or_20ft_Count', 'TX_PTL_or_20ft_Count', 'IN_PTL_or_20ft_Count', 'PA_PTL_or_20ft_Count', 'GA_PTL_or_20ft_Count'])
-    df_InputData = df_InputData.drop(columns=['WA_FTL_or_40ft_Count', 'NV_FTL_or_40ft_Count', 'NE_FTL_or_40ft_Count', 'TX_FTL_or_40ft_Count', 'IN_FTL_or_40ft_Count', 'PA_FTL_or_40ft_Count', 'GA_FTL_or_40ft_Count'])
+    df_InputData = df_InputData.drop(columns=['WA_ITEMORDERQTY', 'NV_ITEMORDERQTY', 'NE_ITEMORDERQTY', 'TX_ITEMORDERQTY', 'IN_ITEMORDERQTY', 'PA_ITEMORDERQTY', 'GA_ITEMORDERQTY'])
+    df_InputData = df_InputData.drop(columns=['WA_FREIGHT_COST', 'NV_FREIGHT_COST', 'NE_FREIGHT_COST', 'TX_FREIGHT_COST', 'IN_FREIGHT_COST', 'PA_FREIGHT_COST', 'GA_FREIGHT_COST'])
+    df_InputData = df_InputData.drop(columns=['WA_SP_COUNT', 'NV_SP_COUNT', 'NE_SP_COUNT', 'TX_SP_COUNT', 'IN_SP_COUNT', 'PA_SP_COUNT', 'GA_SP_COUNT'])
+    df_InputData = df_InputData.drop(columns=['WA_LTL_COUNT', 'NV_LTL_COUNT', 'NE_LTL_COUNT', 'TX_LTL_COUNT', 'IN_LTL_COUNT', 'PA_LTL_COUNT', 'GA_LTL_COUNT'])
+    df_InputData = df_InputData.drop(columns=['WA_PTL_OR_20FT_COUNT', 'NV_PTL_OR_20FT_COUNT', 'NE_PTL_OR_20FT_COUNT', 'TX_PTL_OR_20FT_COUNT', 'IN_PTL_OR_20FT_COUNT', 'PA_PTL_OR_20FT_COUNT', 'GA_PTL_OR_20FT_COUNT'])
+    df_InputData = df_InputData.drop(columns=['WA_FTL_OR_40FT_COUNT', 'NV_FTL_OR_40FT_COUNT', 'NE_FTL_OR_40FT_COUNT', 'TX_FTL_OR_40FT_COUNT', 'IN_FTL_OR_40FT_COUNT', 'PA_FTL_OR_40FT_COUNT', 'GA_FTL_OR_40FT_COUNT'])
     df_InputData = df_InputData.drop(columns=['WAWEIGHT_OPTION', 'NVWEIGHT_OPTION', 'NEWEIGHT_OPTION', 'TXWEIGHT_OPTION', 'INWEIGHT_OPTION', 'PAWEIGHT_OPTION', 'GAWEIGHT_OPTION'])
     df_InputData = df_InputData.drop(columns=['WACUBE_OPTION', 'NVCUBE_OPTION', 'NECUBE_OPTION', 'TXCUBE_OPTION', 'INCUBE_OPTION', 'PACUBE_OPTION', 'GACUBE_OPTION'])
     df_InputData = df_InputData.drop(columns=['WAQTY_OPTION', 'NVQTY_OPTION', 'NEQTY_OPTION', 'TXQTY_OPTION', 'INQTY_OPTION', 'PAQTY_OPTION', 'GAQTY_OPTION'])
-    df_InputData = df_InputData.drop(columns=['WA_WEIGHT_Coverage', 'NV_WEIGHT_Coverage', 'NE_WEIGHT_Coverage', 'TX_WEIGHT_Coverage', 'IN_WEIGHT_Coverage', 'PA_WEIGHT_Coverage', 'GA_WEIGHT_Coverage'])
-    df_InputData = df_InputData.drop(columns=['WA_CUBE_Coverage', 'NV_CUBE_Coverage', 'NE_CUBE_Coverage', 'TX_CUBE_Coverage', 'IN_CUBE_Coverage', 'PA_CUBE_Coverage', 'GA_CUBE_Coverage'])
-    df_InputData = df_InputData.drop(columns=['WA_Qty_Coverage', 'NV_Qty_Coverage', 'NE_Qty_Coverage', 'TX_Qty_Coverage', 'IN_Qty_Coverage', 'PA_Qty_Coverage', 'GA_Qty_Coverage'])
+    df_InputData = df_InputData.drop(columns=['WA_WEIGHT_COVERAGE', 'NV_WEIGHT_COVERAGE', 'NE_WEIGHT_COVERAGE', 'TX_WEIGHT_COVERAGE', 'IN_WEIGHT_COVERAGE', 'PA_WEIGHT_COVERAGE', 'GA_WEIGHT_COVERAGE'])
+    df_InputData = df_InputData.drop(columns=['WA_CUBE_COVERAGE', 'NV_CUBE_COVERAGE', 'NE_CUBE_COVERAGE', 'TX_CUBE_COVERAGE', 'IN_CUBE_COVERAGE', 'PA_CUBE_COVERAGE', 'GA_CUBE_COVERAGE'])
+    df_InputData = df_InputData.drop(columns=['WA_QTY_COVERAGE', 'NV_QTY_COVERAGE', 'NE_QTY_COVERAGE', 'TX_QTY_COVERAGE', 'IN_QTY_COVERAGE', 'PA_QTY_COVERAGE', 'GA_QTY_COVERAGE'])
     df_InputData = df_InputData.drop(columns=['WA_ORDERED', 'NV_ORDERED', 'NE_ORDERED', 'TX_ORDERED', 'IN_ORDERED', 'PA_ORDERED', 'GA_ORDERED'])
     df_InputData = df_InputData.drop(columns=['WACUBE', 'NVCUBE', 'NECUBE', 'TXCUBE', 'INCUBE', 'PACUBE', 'GACUBE'])
     df_InputData = df_InputData.drop(columns=['WAQTY', 'NVQTY', 'NEQTY', 'TXQTY', 'INQTY', 'PAQTY', 'GAQTY'])
     df_InputData = df_InputData.drop(columns=['WAWEIGHT', 'NVWEIGHT', 'NEWEIGHT', 'TXWEIGHT', 'INWEIGHT', 'PAWEIGHT', 'GAWEIGHT'])
-    df_InputData = df_InputData.drop(columns=['Total_SolCost_rand', 'ITERATION_COUNT', 'SOLUTION_RANK_ITERATION', 'SOLUTION_RANK_FINAL'])
-    df_InputData = df_InputData[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_Original',
-                                 'Output_OriginalCost', 'FC_Limited', 'Redistribution_Qty', 'Output_Redistributed', 'Output_RedistributedCost', 'CASEQUANTITY', 'ITEMCUBE', 'FIFOAVERAGECOST', 'Item_Constraint_Used', 'Item_MOQMOV_Type', 'Redistribution_Qty_ItemMOQ', 
-                                 'Constraint_Total_Applicable', 'Roundup_ItemMOQ', 'Output_OrderQty_ItemMOQ', 'Output_OrderCost_ItemMOQ', 'Case_RoundType', 'Output_CaseRoundQty', 'Output_CaseRoundCost', 'Item_Pallet_Type', 'Item_Pallet_Constraint', 'Item_Pallet_TotalRound', 'Output_ItemPalletQty', 'Output_ItemPalletCost', 'Brand_MOV_Type', 'Brand_MOV_Used', 'MOV_RoundUnits', 
-                                 'MOV_ReqRoundAdd_Pallet', 'Output_BrandMOVQty', 'Output_BrandMOVCost', 'BRAND_CUBEWEIGHTUNIT_TYPE', 'BRANDCUBE_TARGET', 'FC_COMBO_ORDERED', 'FC_COUNT', 'FC_COMBO_OPTION', 'FC_COUNT_OPTION', 'TOTAL_CUBE_NETWORK', 'ORIGIN', 'Total_Freight_Cost', 'SCENARIO_ADD_COST_OBSHIP', 'NETWORK_TOTALCOST', 'SCENARIO_OOS_LOST_MARGIN', 'HOLDING_COST_ADD', 'Total_SolCost', 'Total_SolCost_Used', 'RFP_ITERATION_COUNT', 'Output_FreightOptQty', 'Output_FreightOptCost', 'Output_FreightOptCube', 'FrghtOpt_FCRedist_To'
-                                ]]
-    
-    
-    #Generate Output Table
-    df_InputData['Last Modified'] = datetime.now()
+    df_InputData = df_InputData.drop(columns=['TOTAL_SOLCOST_rand', 'ITERATION_COUNT', 'SOLUTION_RANK_OTF', 'SOLUTION_RANK_FC_COMBO'])
+    # df_InputData = df_InputData[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_Original', 'Output_OriginalCost', 'FC_Limited', 'REDISTRIBUTION_QTY', 'OUTPUT_REDISTRIBUTED',
+    #     'OUTPUT_REDISTRIBUTEDCOST', 'CASEQUANTITY', 'ITEMCUBE', 'FIFOAVERAGECOST', 'ITEM_CONSTRAINT_USED', 'ITEM_MOQMOV_TYPE', 'REDISTRIBUTION_QTY_ITEMMOQ', 'CONSTRAINT_TOTAL_APPLICABLE', 'ROUNDUP_ITEMMOQ', 'OUTPUT_ORDERQTY_ITEMMOQ', 'OUTPUT_ORDERCOST_ITEMMOQ',
+    #     'CASE_ROUNDTYPE', 'OUTPUT_CASEROUNDQTY', 'OUTPUT_CASEROUNDCOST', 'ITEM_PALLET_TYPE', 'ITEM_PALLET_CONSTRAINT', 'ITEM_PALLET_TOTALROUND', 'OUTPUT_ITEMPALLETQTY', 'OUTPUT_ITEMPALLETCOST', 'BRAND_MOV_TYPE', 'BRAND_MOV_USED', 'MOV_ROUNDUNITS',
+    #     'MOV_REQROUNDADD_PALLET', 'OUTPUT_BRANDMOVQTY', 'OUTPUT_BRANDMOVCOST', 'BRAND_CUBEWEIGHTUNIT_TYPE', 'BRANDCUBE_TARGET', 'FC_COMBO_ORDERED', 'FC_COUNT', 'FC_COMBO_OPTION', 'FC_COUNT_OPTION', 'TOTAL_CUBE_NETWORK','ORIGIN', 'TOTAL_FREIGHT_COST',
+    #     'SCENARIO_ADD_COST_OBSHIP', 'NETWORK_TOTALCOST', 'SCENARIO_OOS_LOST_MARGIN', 'HOLDING_COST_ADD', 'TOTAL_SOLCOST', 'TOTAL_SOLCOST_Used', 'RFP_ITERATION_COUNT', 'Output_BrandCubeQty', 'Output_FreightOptQty', 'Output_FreightOptCost', 'Output_FreightOptCube', 'FrghtOpt_FCRedist_To', 'Last Modified'
+    # ]]
+
+
+    # session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_OrderDecision_TestTemp')
 
     iteration_count = df_InputData['RFP_ITERATION_COUNT'].iloc[0]
 
     if iteration_count == 1:
-        session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_OrderDecision')
+        session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_OrderDecision')
     else:
-        session.create_dataframe(df_InputData).write.mode("append").saveAsTable('inventorysandbox.dbo.RFP_OrderDecision')
+        session.create_dataframe(df_InputData).write.mode("append").saveAsTable('inventorysandbox.DBO.RFP_Simulation_OrderDecision')
+    
+    # iteration_count = df_InputData['RFP_ITERATION_COUNT'].iloc[0]
+    
+    # if iteration_count == 1:
+    #     session.write_pandas(
+    #         df=df_InputData,
+    #         table_name='inventorysandbox.DBO.RFP_Simulation_OrderDecision',
+    #         auto_create_table=False,  # Set to True if you want Snowflake to create the table if not exists
+    #         overwrite=True            # Overwrite/replace existing table
+    #     )
+    # else:
+    #     session.write_pandas(
+    #         df=df_InputData,
+    #         table_name='inventorysandbox.DBO.RFP_Simulation_OrderDecision',
+    #         auto_create_table=False,
+    #         overwrite=False           # Append to existing table
+    #     )
 
     
-    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_OrderDecision')
+    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_OrderDecision')
+
+#Call Following Step
+    # session.sql("CALL inventorysandbox.DBO.AOG6A_Test()").collect()
     
     #To View Speed
-    # return(session.create_dataframe([1]))
+    return 1
 
 
         #Optional - View Output   
     # df_InputData = session.create_dataframe(df_InputData)
-    # return df_InputData#.filter(col("SUPPLIERID") == '1688');
+    # return df_InputData.filter((col('ORDERTYPE') == 'domestic') & (col("SUPPLIERID") == '1880'));
 
 
 #Alter warehouse IBOPTIMIZATION_WH suspend;
