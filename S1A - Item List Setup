@@ -1,26 +1,35 @@
+--UPDATE FROM TESTING -> CHANGE ALL .TEST ING to .DBO
+--DIFFERENCES FROM DAILY:
+    --_Sim ulation to _Sim utliation_Daily
+--DIFFERENCES FROM CURRENT:
+    --_CURRENT to _Simulation
+
+
 create or replace task Step_1A_RFPGen_Simulation
     warehouse = INVENTORYMODEL_WH
     as begin
 
 
-    create or replace table inventorysandbox.dbo.RFP_Sim_ItemList as (  
+    create or replace table inventorysandbox.DBO.RFP_Simulation_ItemList as (  
     
-    SELECT 
-        prod.PARTNUMBER,
-        prod.ITEMID,
-        prod.SUPPLIERID,
-        prod.BRAND,
-        PRODUCT.CASEQUANTITY,
-        prod.PROCUREMENTSTATUS,
-        prod.CURRENTSUPPLIERPROCUREMENTSTATUS
-    FROM lakehouse.spreedw_dim.product prod
-        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT PRODUCT ON PRODUCT.ITEMID = prod.ITEMID
+    SELECT *
+        -- prod.PARTNUMBER,
+        -- prod.ITEMID,
+        -- prod.SUPPLIERID,
+        -- prod.BRAND,
+        -- PRODUCT.CASEQUANTITY,
+        -- prod.PROCUREMENTSTATUS,
+        -- prod.CURRENTSUPPLIERPROCUREMENTSTATUS
+    FROM inventorysandbox.dbo.ERVW_RFP_ITEMORIGIN
+    -- FROM lakehouse.spreedw_dim.product prod
+    --     LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT PRODUCT ON PRODUCT.ITEMID = prod.ITEMID
     WHERE 
-        prod.PROCUREMENTSTATUS = 'Replenish' 
-        AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish' 
+        PROCUREMENTSTATUS = 'Replenish'
+        -- prod.PROCUREMENTSTATUS = 'Replenish' 
+        -- AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish' 
     
     );
 
-execute task INVENTORYSANDBOX.DBO.AOG_Orch_Simulation;
+execute task inventorysandbox.DBO.AOG_Orch_Simulation;
 
 END
