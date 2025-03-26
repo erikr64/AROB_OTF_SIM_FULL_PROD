@@ -1,0 +1,26 @@
+create or replace task Step_1A_RFPGen_Simulation
+    warehouse = INVENTORYMODEL_WH
+    as begin
+
+
+    create or replace table inventorysandbox.dbo.RFP_Sim_ItemList as (  
+    
+    SELECT 
+        prod.PARTNUMBER,
+        prod.ITEMID,
+        prod.SUPPLIERID,
+        prod.BRAND,
+        PRODUCT.CASEQUANTITY,
+        prod.PROCUREMENTSTATUS,
+        prod.CURRENTSUPPLIERPROCUREMENTSTATUS
+    FROM lakehouse.spreedw_dim.product prod
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT PRODUCT ON PRODUCT.ITEMID = prod.ITEMID
+    WHERE 
+        prod.PROCUREMENTSTATUS = 'Replenish' 
+        AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish' 
+    
+    );
+
+execute task INVENTORYSANDBOX.DBO.AOG_Orch_Simulation;
+
+END
