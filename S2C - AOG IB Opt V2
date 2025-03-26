@@ -1,0 +1,787 @@
+# UPDATE FROM TESTING -> CHANGE ALL .TEST ING to .DBO
+# DIFFERENCES FROM CURRENT:
+#     _Curr ent to _Simulation
+
+#Python Code Created by: Erik R
+#Code Last Updated: 3/26/2025 @10:45am
+#Procedure Name: Step_2C_RFPGen_Simulation
+#Code Guide Avail Here:
+#Difference is that the input is from origin decision and the constraints are pulled from there as well for cube rounding! Cube rounding is added back
+
+#Updates:
+#10/10/2024 - Updated RFP Ordering sim input logic to pull in most recent ten orders generated.
+#03/26/2025 - Updated the case pack rounding logic to network redistribution logic, removed from step 1B
+
+import snowflake.snowpark as snowpark
+import numpy as np
+import pandas as pd
+import random
+from snowflake.snowpark.functions import col
+from datetime import *
+
+def main(session: snowpark.Session): 
+
+    # Adjust Warehouse Size
+    session.sql("ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'LARGE'").collect()
+
+################
+#START OF REDISTRIBUTION
+################
+
+#Gather Order Information from Python Order Generation
+    OrderData = """
+        With Constraint_Setup as (
+        Select
+            ITEMID,
+            SUPPLIERID,
+            CASE WHEN ORDER_TYPE = 'Domestic' THEN 'domestic' ELSE 'import' END as ORDERTYPE,
+            CASE WHEN C1 IS NOT NULL THEN 1 WHEN C2 IS NOT NULL THEN 1
+                WHEN C3 IS NOT NULL THEN 1 WHEN C4 IS NOT NULL THEN 1
+                WHEN C5 IS NOT NULL THEN 1 WHEN C6 IS NOT NULL THEN 1
+                WHEN C7 IS NOT NULL THEN 1 WHEN C8 IS NOT NULL THEN 1
+                WHEN C9 IS NOT NULL THEN 1 WHEN C10 IS NOT NULL THEN 1
+                WHEN C11 IS NOT NULL THEN 1 WHEN C12 IS NOT NULL THEN 1
+                WHEN C13 IS NOT NULL THEN 1 WHEN C14 IS NOT NULL THEN 1
+                WHEN C15 IS NOT NULL THEN 1 WHEN C16 IS NOT NULL THEN 1 ELSE NULL END as ANY_CONSTRAINT
+            -- IFNULL(C1,IFNULL(C2,IFNULL(C3,IFNULL(C4,IFNULL(C5,IFNULL(C6,IFNULL(C7,IFNULL(C8,IFNULL(C9,IFNULL(C10,IFNULL(C11,IFNULL(C12,IFNULL(C13,IFNULL(C14,IFNULL(C15,C16))))))))))))))) as ANY_CONSTRAINT
+        from INVENTORYSANDBOX.DBO.IB_CONSTRAINTS
+        )
+
+        , NetworkOrder as (
+        Select
+            ITEMID,
+            UPDATED_ORDERTYPE,
+            OTF,
+            LT,
+            SUM(UPDATED_ORDERQTY) as NetOrder
+        from inventorysandbox.DBO.RFP_Simulation_OriginDecision
+        GROUP BY ITEMID, UPDATED_ORDERTYPE, OTF, LT
+        HAVING SUM(UPDATED_ORDERQTY) <= 0
+        )
+
+        Select 
+            sim.* 
+        from inventorysandbox.DBO.RFP_Simulation_OriginDecision sim
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.DBO.RFP_Simulation_OriginDecision) MaxCount
+        LEFT JOIN Constraint_Setup CON_ITEM ON CON_ITEM.ITEMID = sim.ITEMID AND CON_ITEM.ORDERTYPE = sim.ordertype
+        LEFT JOIN Constraint_Setup CON_BRAND ON CON_BRAND.SUPPLIERID = sim.SUPPLIERID AND CON_BRAND.ORDERTYPE = sim.ordertype AND CON_BRAND.ITEMID IS NULL
+        LEFT JOIN NetworkOrder on NetworkOrder.ITEMID = sim.ITEMID AND NetworkOrder.UPDATED_ORDERTYPE = sim.updated_ordertype AND NetworkOrder.OTF = sim.OTF AND NetworkOrder.LT = sim.LT
+        WHERE MAX_COUNT = RFP_ITERATION_COUNT
+        AND (CON_ITEM.ANY_CONSTRAINT IS NOT NULL OR CON_BRAND.ANY_CONSTRAINT IS NOT NULL)
+        AND NetworkOrder.ITEMID IS NULL
+        --AND ITEMID = 408394
+        """
+        #Create & Filter Output (Item or Brand Options)
+    df_OrderData = session.sql(OrderData)#.filter(col('ITEMID') == 123456)
+        #Covert to Pandas
+    df_OrderData = df_OrderData.to_pandas()
+    df_OrderData['UPDATED_ORDERQTY'] = np.where(pd.isnull(df_OrderData['UPDATED_ORDERQTY']), 0, df_OrderData['UPDATED_ORDERQTY'])
+    df_OrderData['FC_CODE'] = np.where(df_OrderData['FC'] == 'WA', 'SEA', np.where(df_OrderData['FC'] == 'NV', 'LAS', np.where(df_OrderData['FC'] == 'NE', 'LNK', np.where(df_OrderData['FC'] == 'TX', 'DFW', 
+                              np.where(df_OrderData['FC'] == 'IN', 'IND', np.where(df_OrderData['FC'] == 'PA', 'AVP', np.where(df_OrderData['FC'] == 'GA', 'SAV', '')))))))
+
+#Gather Constraint Data
+        #Temporary Constraint Table
+    Constraints = 'INVENTORYSANDBOX.DBO.IB_CONSTRAINTS'
+        #Create & Filter Output (Item & Brand Options)
+    df_ItemConstraints = session.table(Constraints).filter(col("Level") == 'Item')
+    df_BrandConstraints = session.table(Constraints).filter(col("Level") == 'Brand')
+        #Covert to Pandas
+    df_ItemConstraints = df_ItemConstraints.to_pandas()
+    df_BrandConstraints = df_BrandConstraints.to_pandas()
+        #Rename Order Type Column
+    df_ItemConstraints['ORDERTYPE'] = df_ItemConstraints['ORDER_TYPE']
+    df_BrandConstraints['ORDERTYPE'] = df_BrandConstraints['ORDER_TYPE']
+        #Remove Excess Columns
+    df_ItemConstraints = df_ItemConstraints[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6']]
+    df_BrandConstraints = df_BrandConstraints.drop(columns=['ITEMID', 'LEVEL', 'ORDER_TYPE', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6']);
+        #Optional - Return Output
+    #df_ItemConstraints = session.create_dataframe(df_ItemConstraints)
+    #return df_ItemConstraints
+    #df_BrandConstraints = session.create_dataframe(df_BrandConstraints)
+    #return df_BrandConstraints
+
+#Add Constraints to Order Data Output & Add Dim Product Required Data
+    df_OrderData['ITEMID'] = df_OrderData['ITEMID'].astype(str)
+    df_ItemConstraints['ITEMID'] = df_ItemConstraints['ITEMID'].astype(str)
+    
+    df_OrderData = pd.merge(df_OrderData, df_ItemConstraints, how='left', on=['ITEMID', 'ORDERTYPE', 'SUPPLIERID'])
+    df_OrderData = pd.merge(df_OrderData, df_BrandConstraints, how='left', on=['ORDERTYPE', 'SUPPLIERID'])
+    
+        #Pull Case Qty, Cube
+    # OrdProd = 'LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT'
+    # OrdProd = session.table(OrdProd)
+    # OrdProd = OrdProd.to_pandas()
+    # OrdProd = OrdProd[['ITEMID', 'CASEQUANTITY', 'ITEMCUBE']]
+    
+    # OrdProd['ITEMID'] = OrdProd['ITEMID'].astype(str)
+    
+    # df_OrderData = pd.merge(df_OrderData, OrdProd, how='left', on=['ITEMID'])
+
+        #Pull Item Cost
+    # ItemCost = """
+    #     Select * from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE Fifo
+    #     INNER JOIN (Select max(DM_UPDATEDON) as MaxDate from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE) as MaxDate on MaxDate.MaxDate = Fifo.DM_UPDATEDON
+    #     --Where ITEMID = 243726
+    #     """
+    # ItemCost = session.sql(ItemCost)
+    # ItemCost = ItemCost.to_pandas()
+    # ItemCost = ItemCost[['ITEMID', 'FIFOAVERAGECOST']]
+    # ItemCost['ITEMID'] = ItemCost['ITEMID'].astype(str)
+    # df_OrderData = pd.merge(df_OrderData, ItemCost, how='left', on=['ITEMID'])
+    
+    df_OrderData['FIFOAVERAGECOST'] = np.maximum(df_OrderData['FIFOAVERAGECOST'], .01)
+    df_OrderData['FIFOAVERAGECOST'].fillna(.01, inplace=True)
+    
+        #Optional - Return Output
+    # df_OrderData = session.create_dataframe(df_OrderData)
+    # return df_OrderData#.filter(col("ITEMID") == '243726');
+
+#Destination Limitation Logic
+    #General Setup
+    df_DestLimit = df_OrderData[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'ORIGIN_CUBETARGET', 'FIFOAVERAGECOST', 'UPDATED_ORDERQTY', 'C17', 'C18', 'C19', 'C20', 'C21', 'C22', 'C23']]
+    df_DestLimit['FC_Limited'] = np.where((df_DestLimit['C17'] == 0) & (df_DestLimit['FC'] == 'WA'), 1, np.where((df_DestLimit['C18'] == 0) & (df_DestLimit['FC'] == 'NV'), 1, np.where((df_DestLimit['C19'] == 0) & (df_DestLimit['FC'] == 'NE'), 1, 
+                                 np.where((df_DestLimit['C20'] == 0) & (df_DestLimit['FC'] == 'TX'), 1, np.where((df_DestLimit['C21'] == 0) & (df_DestLimit['FC'] == 'IN'), 1, np.where((df_DestLimit['C22'] == 0) & (df_DestLimit['FC'] == 'PA'), 1, 
+                                 np.where((df_DestLimit['C23'] == 0) & (df_DestLimit['FC'] == 'GA'), 1, 0)))))))
+
+    #Redistribution Table Query
+    Redistribution = """
+            Select
+                FC,
+                SEA, LAS, LNK, DFW, IND, AVP, SAV, ONT
+                from INVENTORYSANDBOX.DBO.ER_REDISTRIBUTIONTABLE
+            """
+    Redistribution = session.sql(Redistribution)
+    Redistribution = Redistribution.to_pandas()
+    df_DestLimit = pd.merge(df_DestLimit, Redistribution, how='left', on=['FC'])
+
+    #OOS Redistribution Setup
+    df_DestLimit['SEA'] = np.where((df_DestLimit['C17'] == 0), 0, df_DestLimit['SEA'])
+    df_DestLimit['LAS'] = np.where((df_DestLimit['C18'] == 0), 0, df_DestLimit['LAS'])
+    df_DestLimit['LNK'] = np.where((df_DestLimit['C19'] == 0), 0, df_DestLimit['LNK'])
+    df_DestLimit['DFW'] = np.where((df_DestLimit['C20'] == 0), 0, df_DestLimit['DFW'])
+    df_DestLimit['IND'] = np.where((df_DestLimit['C21'] == 0), 0, df_DestLimit['IND'])
+    df_DestLimit['AVP'] = np.where((df_DestLimit['C22'] == 0), 0, df_DestLimit['AVP'])
+    df_DestLimit['SAV'] = np.where((df_DestLimit['C23'] == 0), 0, df_DestLimit['SAV'])
+    df_DestLimit['ONT'] = 0
+    
+    df_DestLimit['TOTAL_REDIST_AVAIL'] = df_DestLimit['SEA'] + df_DestLimit['LAS'] + df_DestLimit['LNK'] + df_DestLimit['DFW'] + df_DestLimit['IND'] + df_DestLimit['AVP'] + df_DestLimit['SAV'] + df_DestLimit['ONT']
+
+    #df_DestLimit = session.create_dataframe(df_DestLimit)
+    #return df_DestLimit#.filter(col("SUPPLIERID") == 183);
+    
+    df_DestLimit['SEA'] = np.round((df_DestLimit['SEA'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['LAS'] = np.round((df_DestLimit['LAS'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['LNK'] = np.round((df_DestLimit['LNK'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['DFW'] = np.round((df_DestLimit['DFW'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['IND'] = np.round((df_DestLimit['IND'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['AVP'] = np.round((df_DestLimit['AVP'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['SAV'] = np.round((df_DestLimit['SAV'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['ONT'] = np.round((df_DestLimit['ONT'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['UPDATED_ORDERQTY'], 0)
+
+    # df_DestLimit = session.create_dataframe(df_DestLimit)
+    # return df_DestLimit#.filter(col("SUPPLIERID") == 183);
+    
+        #Filter Output
+    df_DestLimit = df_DestLimit[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'ORIGIN_CUBETARGET', 'FIFOAVERAGECOST', 'UPDATED_ORDERQTY', 'FC_Limited', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
+        #Optional - Return Output
+    # df_DestLimit = session.create_dataframe(df_DestLimit)
+    # return df_DestLimit#.filter(col("ITEMID") == '243726');
+
+        #Sum Order Qty for redistributed FCs
+    df_DestLimit_SubsetA = df_DestLimit[df_DestLimit["FC_Limited"] == 1]
+    df_DestLimit_SubsetA = df_DestLimit_SubsetA[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
+    df_DestLimit_SubsetA = df_DestLimit_SubsetA.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum() 
+        #Final Filter
+    df_DestLimit_SubsetA = df_DestLimit_SubsetA[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
+        #Optional - Return Output
+    #df_DestLimit_SubsetA = session.create_dataframe(df_DestLimit_SubsetA)
+    #return df_DestLimit_SubsetA
+
+    #Join Redistrbuted Order Qty to Baseline Dataset
+    df_DestLimit = df_DestLimit.drop(columns=[ 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT'])
+    df_DestLimit = pd.merge(df_DestLimit, df_DestLimit_SubsetA, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+        #Add Redistributed Order Qty to Cap Order Qty
+    df_DestLimit['Redistribution_Qty'] = np.where(df_DestLimit['FC_Limited'] == 1, -df_DestLimit['UPDATED_ORDERQTY'], 
+                                                    np.where(df_DestLimit['FC_CODE'] == 'SEA', df_DestLimit['SEA'], np.where(df_DestLimit['FC_CODE'] == 'LAS', df_DestLimit['LAS'], np.where(df_DestLimit['FC_CODE'] == 'LNK', df_DestLimit['LNK'],
+                                                    np.where(df_DestLimit['FC_CODE'] == 'IND', df_DestLimit['IND'], np.where(df_DestLimit['FC_CODE'] == 'AVP', df_DestLimit['AVP'], np.where(df_DestLimit['FC_CODE'] == 'SAV', df_DestLimit['SAV'],
+                                                    np.where(df_DestLimit['FC_CODE'] == 'DFW', df_DestLimit['DFW'], np.where(df_DestLimit['FC_CODE'] == 'ONT', df_DestLimit['ONT'], 0)))))))))
+    df_DestLimit['Output_Original'] = np.round(df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['Redistribution_Qty'].fillna(0, inplace=True)
+    
+    df_DestLimit['Output_Redistributed'] = np.round(df_DestLimit['Redistribution_Qty'] + df_DestLimit['UPDATED_ORDERQTY'], 0)
+    df_DestLimit['Output_RedistributedCost'] = df_DestLimit['Output_Redistributed'] * df_DestLimit['FIFOAVERAGECOST']
+    df_DestLimit['Output_Redistributed'].fillna(0, inplace=True)
+    df_DestLimit['Output_RedistributedCost'].fillna(0, inplace=True)
+    df_DestLimit['Output_OriginalCost'] = df_DestLimit['Output_Original'] * df_DestLimit['FIFOAVERAGECOST']
+        #Final Filter
+    df_DestLimit = df_DestLimit[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'ORIGIN_CUBETARGET', 'Output_Original', 'Output_OriginalCost', 'FC_Limited', 'Redistribution_Qty', 'Output_Redistributed', 'Output_RedistributedCost']]
+        #Optional - Return Output
+    # df_DestLimit = session.create_dataframe(df_DestLimit)
+    # return df_DestLimit.filter(col("ITEMID") == 23319);
+
+        #Generate Output Table
+    #df_DestLimit['Last Modified']= datetime.now()
+    #session.create_dataframe(df_DestLimit).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.ER_ordering_sim_redist')
+
+    #return(session.create_dataframe([1]))
+
+################
+#END OF REDISTRIBUTION
+################
+
+################
+#START OF ITEM MOQ
+################
+
+#Gather Constraint Data
+        #Temporary Constraint Table
+    Constraints = 'INVENTORYSANDBOX.DBO.IB_CONSTRAINTS'
+        #Create & Filter Output (Item & Brand Options)
+    df_ItemConstraints = session.table(Constraints).filter(col("Level") == 'Item')
+        #Covert to Pandas
+    df_ItemConstraints = df_ItemConstraints.to_pandas()
+        #Rename Order Type Column
+    df_ItemConstraints['ORDERTYPE'] = df_ItemConstraints['ORDER_TYPE']
+        #Remove Excess Columns
+    df_ItemConstraints = df_ItemConstraints[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'C3', 'C4', 'C5', 'C6']];
+        #Optional - Return Output
+    #df_ItemConstraints = session.create_dataframe(df_ItemConstraints)
+    #return df_ItemConstraints
+
+#Add Constraints to Order Data Output & Add Dim Product Required Data
+    df_InputData = df_DestLimit
+    df_ItemConstraints['ITEMID'] = df_ItemConstraints['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, df_ItemConstraints, how='left', on=['ITEMID', 'ORDERTYPE', 'SUPPLIERID'])
+    
+        #Pull Case Qty, Cube
+    OrdProd = 'LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT'
+    OrdProd = session.table(OrdProd)
+    OrdProd = OrdProd.to_pandas()
+    OrdProd = OrdProd[['ITEMID', 'CASEQUANTITY', 'ITEMCUBE']]
+    OrdProd['ITEMID'] = OrdProd['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, OrdProd, how='left', on=['ITEMID'])
+
+        #Pull Item Cost
+    ItemCost = """
+        Select * from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE Fifo
+        --INNER JOIN (Select max(DM_UPDATEDON) as MaxDate from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE) as MaxDate on MaxDate.MaxDate = Fifo.DM_UPDATEDON
+        --Where ITEMID = 243726
+        """
+    ItemCost = session.sql(ItemCost)
+    ItemCost = ItemCost.to_pandas()
+    ItemCost = ItemCost[['ITEMID', 'FIFOAVERAGECOST']]
+    ItemCost['ITEMID'] = ItemCost['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, ItemCost, how='left', on=['ITEMID'])
+    
+    df_InputData['FIFOAVERAGECOST'] = np.maximum(df_InputData['FIFOAVERAGECOST'], .01)
+    df_InputData['FIFOAVERAGECOST'].fillna(.01, inplace=True)
+    
+        #Optional - Return Output
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter(col("ITEMID") == '243726');
+
+#Determine Constraint Used & Add Output Cost for MOV's
+    df_InputData['Item_Constraint_Used'] = np.where(df_InputData['C3'] > 0, df_InputData['C3'], np.where(df_InputData['C4'] > 0, df_InputData['C4'], np.where(df_InputData['C5'] > 0, df_InputData['C5'], np.where(df_InputData['C6'] > 0, df_InputData['C6'], 0))))
+    df_InputData['Item_Constraint_Type'] = np.where(df_InputData['C3'] > 0, 'MOV, Per Ship', np.where(df_InputData['C4'] > 0, 'MOQ, Per Ship', np.where(df_InputData['C5'] > 0, 'MOV, Per Mast', np.where(df_InputData['C6'] > 0, 'MOQ, Per Mast', ''))))
+    df_InputData['Item_Constraint_Level'] = np.where(df_InputData['C3'] > 0, 'Ship', np.where(df_InputData['C4'] > 0, 'Ship', np.where(df_InputData['C5'] > 0, 'Mast', np.where(df_InputData['C6'] > 0, 'Mast', ''))))
+    
+#Calculate Item Network Cost or Qty; FC Cost / Qty is just the individual item's output
+    Net_MOV = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_RedistributedCost']]
+    Net_MOV = Net_MOV.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOV['MOV_TotalStep1'] = Net_MOV['Output_RedistributedCost']
+    Net_MOV = Net_MOV[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOV_TotalStep1']]
+
+    Net_MOQ = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_Redistributed']]
+    Net_MOQ = Net_MOQ.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOQ['MOQ_TotalStep1'] = Net_MOQ['Output_Redistributed']
+    Net_MOQ = Net_MOQ[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOQ_TotalStep1']]
+
+        #Join to Input Data dataframe
+    Net_MOV['ITEMID'] = Net_MOV['ITEMID'].astype(str)
+    Net_MOQ['ITEMID'] = Net_MOQ['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, Net_MOV, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Net_MOQ, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+
+#Baseline Round & Redistribution Logic
+    df_InputData['Constraint_Item_Applicable'] = np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Ship', df_InputData['Output_RedistributedCost'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Ship', df_InputData['Output_Redistributed'],
+                                                  np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Mast', df_InputData['Output_RedistributedCost'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Mast', df_InputData['Output_Redistributed'], 0))))
+    df_InputData['Constraint_Total_Applicable'] = np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Ship', df_InputData['Output_RedistributedCost'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Ship', df_InputData['Output_Redistributed'],
+                                                  np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Mast', df_InputData['MOV_TotalStep1'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Mast', df_InputData['MOQ_TotalStep1'], 0))))
+        #Round V1 Logic
+    df_InputData['Calc_Baseline_RoundV1'] = np.where(df_InputData['Output_Redistributed'] == 0, 0, df_InputData['Item_Constraint_Used'] - df_InputData['Constraint_Total_Applicable'])
+    df_InputData['Calc_Round_DecisionV1'] = np.where(df_InputData['Constraint_Item_Applicable'] == 0, '', 
+                                                     np.where((df_InputData['Calc_Baseline_RoundV1'] / df_InputData['Constraint_Item_Applicable']) > .25, 'Redistribute', 'Round'))
+    
+        #Total Redistribution Units / Cost
+    Total_RedistV1 = df_InputData[df_InputData["Calc_Round_DecisionV1"] == 'Redistribute']
+    Total_RedistV1 = Total_RedistV1.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False)['Output_Redistributed'].sum()
+    Total_RedistV1 = Total_RedistV1.rename(columns={'Output_Redistributed': 'Redist_Avail'}) #Old Name, New Name
+    Total_RedistV1['ITEMID'] = Total_RedistV1['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, Total_RedistV1, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+        #Redist # of MOQ/MOVs
+    df_InputData['Redist_OrderCountAvail'] = np.where(df_InputData['Redist_Avail'] == 0, 0, np.where(df_InputData['Item_Constraint_Used'] == 0, 0, 
+                                                        np.round(df_InputData['Redist_Avail'] / df_InputData['Item_Constraint_Used'], 0)))
+        #Number of Non-Redist FCs
+    Total_RedistV2 = df_InputData[(df_InputData["Calc_Round_DecisionV1"] != 'Redistribute') & (df_InputData["Calc_Round_DecisionV1"] != '')]
+    Total_RedistV2['One'] = 1
+    Total_RedistV2 = Total_RedistV2.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False)['One'].sum()
+    Total_RedistV2 = Total_RedistV2.rename(columns={'One': 'Redist_FCCountAvail'}) #Old Name, New Name
+    Total_RedistV2['ITEMID'] = Total_RedistV2['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, Total_RedistV2, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+        #FC Order Rank
+    df_InputData['Output_Redistributed_rand'] = np.where(df_InputData['Output_Redistributed'] == 0, 0, df_InputData['Output_Redistributed'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    FC_Rank = df_InputData[(df_InputData['Output_Redistributed'] > 0) & (df_InputData["Calc_Round_DecisionV1"] != 'Round')]
+    FC_Rank['FC_OrderRankV1'] = FC_Rank.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_Redistributed_rand'].rank(method='dense', ascending=False)
+    FC_Rank = FC_Rank[['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC_OrderRankV1']]
+    FC_Rank['ITEMID'] = FC_Rank['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, FC_Rank, how='left', on=['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+        #FC Round Decision Final
+    df_InputData['Calc_Round_DecisionV2'] = np.where(df_InputData['Output_Redistributed'] == 0, '', 
+                                                     np.where(df_InputData['Calc_Round_DecisionV1'] == 'Round', 'Round', 
+                                                              np.where(df_InputData['FC_OrderRankV1'] <= df_InputData['Redist_OrderCountAvail'], 'Round', 'Redistribute')))                                                                                       
+    
+#Redistribution Logic
+        #Redistribution Table Query
+    Redistribution = """
+            Select
+                FC,
+                SEA, LAS, LNK, DFW, IND, AVP, SAV, ONT
+                from INVENTORYSANDBOX.DBO.ER_REDISTRIBUTIONTABLE
+            """
+    Redistribution = session.sql(Redistribution)
+    Redistribution = Redistribution.to_pandas()
+    df_InputData = pd.merge(df_InputData, Redistribution, how='left', on=['FC']) 
+    
+        #Pull Rounding Decision for other FCs to remove from Redistribution %'s
+    fc_values = ['WA', 'NV', 'NE', 'TX', 'IN', 'PA', 'GA']
+    def get_other_decision(row, fc):
+        key_tuple = (row['ITEMID'], fc, row['SUPPLIERID'], row['UPDATED_ORDERTYPE'], row['OTF'], row['LT'], row['CAP_DOS'])
+        return decision_map.get(key_tuple)
+    
+    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Calc_Round_DecisionV2'].to_dict()
+    for fc in fc_values:
+        df_InputData[f'{fc}_RoundDecision'] = df_InputData.apply(get_other_decision, axis=1, fc=fc)
+        
+        #Remove blank & Redistribute Values from Redistribution Values
+    df_InputData['SEA'] = np.where((df_InputData['WA_RoundDecision'] != 'Round'), 0, df_InputData['SEA'])
+    df_InputData['LAS'] = np.where((df_InputData['NV_RoundDecision'] != 'Round'), 0, df_InputData['LAS'])
+    df_InputData['LNK'] = np.where((df_InputData['NE_RoundDecision'] != 'Round'), 0, df_InputData['LNK'])
+    df_InputData['DFW'] = np.where((df_InputData['TX_RoundDecision'] != 'Round'), 0, df_InputData['DFW'])
+    df_InputData['IND'] = np.where((df_InputData['IN_RoundDecision'] != 'Round'), 0, df_InputData['IND'])
+    df_InputData['AVP'] = np.where((df_InputData['PA_RoundDecision'] != 'Round'), 0, df_InputData['AVP'])
+    df_InputData['SAV'] = np.where((df_InputData['GA_RoundDecision'] != 'Round'), 0, df_InputData['SAV'])
+    df_InputData['ONT'] = 0
+
+        #Total Redistribution Avail & Final Redist %
+    df_InputData['TOTAL_REDIST_AVAIL'] = df_InputData['SEA'] + df_InputData['LAS'] + df_InputData['LNK'] + df_InputData['DFW'] + df_InputData['IND'] + df_InputData['AVP'] + df_InputData['SAV'] + df_InputData['ONT']
+    df_InputData['SEA'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['SEA'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+    df_InputData['LAS'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['LAS'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+    df_InputData['LNK'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['LNK'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+    df_InputData['DFW'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['DFW'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+    df_InputData['IND'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['IND'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+    df_InputData['AVP'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['AVP'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+    df_InputData['SAV'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['SAV'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+    df_InputData['ONT'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['ONT'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
+
+        #Aggregate for final add to order qty
+    df_InputData['SEA'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SEA'].transform('sum')
+    df_InputData['LAS'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LAS'].transform('sum')
+    df_InputData['LNK'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LNK'].transform('sum')
+    df_InputData['DFW'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['DFW'].transform('sum')
+    df_InputData['IND'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['IND'].transform('sum')
+    df_InputData['AVP'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['AVP'].transform('sum')
+    df_InputData['SAV'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SAV'].transform('sum')
+    
+        #Final Redistribution Qty
+    df_InputData['Redistribution_Qty_ItemMOQ'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Redistribute', -df_InputData['Output_Redistributed'],
+                                                    np.where(df_InputData['FC_CODE'] == 'SEA', df_InputData['SEA'], np.where(df_InputData['FC_CODE'] == 'LAS', df_InputData['LAS'], np.where(df_InputData['FC_CODE'] == 'LNK', df_InputData['LNK'],
+                                                    np.where(df_InputData['FC_CODE'] == 'IND', df_InputData['IND'], np.where(df_InputData['FC_CODE'] == 'AVP', df_InputData['AVP'], np.where(df_InputData['FC_CODE'] == 'SAV', df_InputData['SAV'],
+                                                    np.where(df_InputData['FC_CODE'] == 'DFW', df_InputData['DFW'], np.where(df_InputData['FC_CODE'] == 'ONT', df_InputData['ONT'], 0)))))))))
+    
+    df_InputData['Redistributed_OrderQty_ItemMOQ'] = np.round(df_InputData['Output_Redistributed'] + df_InputData['Redistribution_Qty_ItemMOQ'], 0)
+    df_InputData = df_InputData.drop(columns=['C3', 'C4', 'C5', 'C6', 'Item_Constraint_Level', 'MOV_TotalStep1', 'MOQ_TotalStep1', 'Calc_Baseline_RoundV1', 'Calc_Round_DecisionV1', 'Redist_FCCountAvail', 'Redist_Avail', 'Redist_OrderCountAvail', 'FC_OrderRankV1', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT', 'WA_RoundDecision', 'NV_RoundDecision', 'NE_RoundDecision', 'TX_RoundDecision', 'IN_RoundDecision', 'PA_RoundDecision', 'GA_RoundDecision', 'TOTAL_REDIST_AVAIL', 'Output_Redistributed_rand', 'Constraint_Item_Applicable', 'Constraint_Total_Applicable'])
+
+#Calculate Item Network Cost or Qty; FC Cost / Qty is just the individual item's output; Regenerate key outputs based on new order values after redistribution
+    df_InputData['Redistributed_OrderCost_ItemMOQ'] = np.round(df_InputData['Redistributed_OrderQty_ItemMOQ'] * df_InputData['FIFOAVERAGECOST'], 2)
+    
+    Net_MOV = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistributed_OrderCost_ItemMOQ']]
+    Net_MOV = Net_MOV.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOV['MOV_TotalStep2'] = Net_MOV['Redistributed_OrderCost_ItemMOQ']
+    Net_MOV = Net_MOV[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOV_TotalStep2']]
+
+    Net_MOQ = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistributed_OrderQty_ItemMOQ']]
+    Net_MOQ = Net_MOQ.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOQ['MOQ_TotalStep2'] = Net_MOQ['Redistributed_OrderQty_ItemMOQ']
+    Net_MOQ = Net_MOQ[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOQ_TotalStep2']]
+    
+    Net_MOV['ITEMID'] = Net_MOV['ITEMID'].astype(str)
+    Net_MOQ['ITEMID'] = Net_MOQ['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, Net_MOV, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Net_MOQ, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    
+    df_InputData['Constraint_Item_Applicable'] = np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Ship', df_InputData['Redistributed_OrderCost_ItemMOQ'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Ship', df_InputData['Redistributed_OrderQty_ItemMOQ'],
+                                                  np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Mast', df_InputData['Redistributed_OrderCost_ItemMOQ'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Mast', df_InputData['Redistributed_OrderQty_ItemMOQ'], 0))))
+    
+    df_InputData['Constraint_Total_Applicable'] = np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Ship', df_InputData['Redistributed_OrderCost_ItemMOQ'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Ship', df_InputData['Redistributed_OrderQty_ItemMOQ'],
+                                                  np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Mast', df_InputData['MOV_TotalStep2'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Mast', df_InputData['MOQ_TotalStep2'], 0))))
+                                                                                                                                            
+#Calculate % Roundup and overall round up required - % roundup will be less than 100% if the requirement is at a master order level vs shipment.
+    df_InputData['%_Roundup_ItemMOQ'] = np.where(df_InputData['Constraint_Total_Applicable'] == 0, 0, df_InputData['Constraint_Item_Applicable'] / df_InputData['Constraint_Total_Applicable'])
+    df_InputData['Roundup_ItemMOQ'] = np.round(df_InputData['%_Roundup_ItemMOQ'] * np.maximum(0, df_InputData['Item_Constraint_Used'] - df_InputData['Constraint_Total_Applicable']), 0)
+        #Final Output
+    df_InputData['Output_OrderQty_ItemMOQ'] = np.where(df_InputData['Item_Constraint_Used'] == 0, df_InputData['Output_Redistributed'], df_InputData['Redistributed_OrderQty_ItemMOQ'] + df_InputData['Roundup_ItemMOQ'])
+    df_InputData['Output_OrderCost_ItemMOQ'] = np.round(df_InputData['Output_OrderQty_ItemMOQ'] * df_InputData['FIFOAVERAGECOST'], 2)
+    df_InputData['Output_OrderQty_ItemMOQ'].fillna(0, inplace=True)
+    df_InputData['Output_OrderCost_ItemMOQ'].fillna(0, inplace=True)
+        #Add Constraint Output
+
+#Final Filter / Rename
+    df_InputData = df_InputData.rename(columns={'Item_Constraint_Type': 'Item_MOQMOV_Type'})
+    df_InputData = df_InputData.drop(columns=['Calc_Round_DecisionV2', 'Redistributed_OrderQty_ItemMOQ', 'Redistributed_OrderCost_ItemMOQ', 'MOV_TotalStep2', 'MOQ_TotalStep2', 'Constraint_Item_Applicable', '%_Roundup_ItemMOQ'])
+
+#Generate Output Table
+    #df_InputData['Last Modified']= datetime.now()
+    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.ER_ordering_sim_ItemMOQ')
+
+#Optional View Outputs
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == 23319);
+#to avoid error
+    #return(session.create_dataframe([1]))
+
+################
+#END OF ITEM MOQ
+################
+
+################
+#START OF ITEM CASE PACK
+################
+
+
+    df_InputData['Case_RoundType'] = np.where((df_InputData['Item_Constraint_Used'] >= (df_InputData['Constraint_Total_Applicable']*.95)) & (df_InputData['Item_Constraint_Used'] > 0), 'Roundup', 'Round')
+    df_InputData['Network_CasePackCount'] = np.round(df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_OrderQty_ItemMOQ'].transform('sum') / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY']
+    
+    df_InputData['CaseRoundQty_V1'] = np.where(df_InputData['Case_RoundType'] == 'Roundup', 
+                                          np.ceil(df_InputData['Output_OrderQty_ItemMOQ'] / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY'], 
+                                          np.round(df_InputData['Output_OrderQty_ItemMOQ'] / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY'])
+
+    df_InputData['Network_CasePackCount_V1'] = np.round(df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['CaseRoundQty_V1'].transform('sum') / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY']
+    
+    df_InputData['Network_CasePackCount_Variance'] = (df_InputData['Network_CasePackCount_V1']  - df_InputData['Network_CasePackCount']) / df_InputData['CASEQUANTITY']
+
+    df_InputData['Output_OrderQty_ItemMOQ_rand'] = np.where(df_InputData['Output_OrderQty_ItemMOQ'] == 0, 0, df_InputData['Output_OrderQty_ItemMOQ'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    df_InputData['FC_OrderRank'] = np.where(df_InputData['Output_OrderQty_ItemMOQ_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_OrderQty_ItemMOQ_rand'].rank(method='dense', ascending=False))
+
+    df_InputData['CasePackAdjust'] = np.where(df_InputData['FC_OrderRank'] > np.abs(df_InputData['Network_CasePackCount_Variance']), 0,
+                                              np.where(df_InputData['Network_CasePackCount_Variance'] < 0, df_InputData['CASEQUANTITY'], -df_InputData['CASEQUANTITY']))
+    
+    
+    df_InputData['Output_CaseRoundQty'] = df_InputData['CaseRoundQty_V1'] + df_InputData['CasePackAdjust']
+    df_InputData['Output_CaseRoundCost'] = df_InputData['Output_CaseRoundQty'] * df_InputData['FIFOAVERAGECOST']
+    df_InputData['Output_CaseRoundQty'].fillna(0, inplace=True)
+    df_InputData['Output_CaseRoundCost'].fillna(0, inplace=True)
+
+    df_InputData = df_InputData.drop(columns=['Network_CasePackCount', 'CaseRoundQty_V1', 'Network_CasePackCount_V1', 'Output_OrderQty_ItemMOQ_rand', 'FC_OrderRank'])
+
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == 203758);
+
+################
+#END OF ITEM CASE PACK
+################
+
+################
+#START OF ITEM PALLET
+################
+
+#Gather Constraint Data
+        #Temporary Constraint Table
+    Constraints = 'INVENTORYSANDBOX.DBO.IB_CONSTRAINTS'
+        #Create & Filter Output (Item & Brand Options)
+    df_ItemConstraints = session.table(Constraints).filter(col("Level") == 'Item')
+        #Covert to Pandas
+    df_ItemConstraints = df_ItemConstraints.to_pandas()
+        #Rename Order Type Column
+    df_ItemConstraints['ORDERTYPE'] = df_ItemConstraints['ORDER_TYPE']
+        #Remove Excess Columns
+    df_ItemConstraints = df_ItemConstraints[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'C1', 'C2']]
+    df_ItemConstraints = df_ItemConstraints.rename(columns={'C1': 'Pallet_Req'}) #Old Name, New Name
+    df_ItemConstraints = df_ItemConstraints.rename(columns={'C2': 'Pallet_Opt'}) #Old Name, New Name
+    df_ItemConstraints['Pallet_Req'].fillna(0, inplace=True)
+    df_ItemConstraints['Pallet_Opt'].fillna(0, inplace=True)
+    s = pd.Series(df_ItemConstraints['Pallet_Req'])
+    df_ItemConstraints['Pallet_Req'] = pd.to_numeric(s, errors='coerce')
+    t = pd.Series(df_ItemConstraints['Pallet_Opt'])
+    df_ItemConstraints['Pallet_Opt'] = pd.to_numeric(t, errors='coerce')
+    del s
+    del t
+    df_ItemConstraints['Pallet_Type'] = np.where(df_ItemConstraints['Pallet_Req'] > 0, 'Req', np.where(df_ItemConstraints['Pallet_Opt'] > 0, 'Opt', 'None'))
+        #Optional - Return Output
+    #df_ItemConstraints = session.create_dataframe(df_ItemConstraints)
+    #return df_ItemConstraints
+        #Merge with existing dataset
+    df_ItemConstraints['ITEMID'] = df_ItemConstraints['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, df_ItemConstraints, how='left', on=['ITEMID', 'ORDERTYPE', 'SUPPLIERID'])
+
+#Item MOQ / MOV from Previous Output
+    df_InputData['ItemMOQ/V_TotalStep1'] =  np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Ship', df_InputData.groupby(['ITEMID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundCost'].transform('sum'), 
+            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Ship', df_InputData.groupby(['ITEMID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum'), 
+            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Mast', df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundCost'].transform('sum'), 
+            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Mast', df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum'), 99999.99))))
+
+#Generate Key Values and Round Decision
+        #Pallet Constraint Value
+    df_InputData['Pall_Constraint'] = np.where(df_InputData['Pallet_Type'] == 'Req', df_InputData['Pallet_Req'], np.where(df_InputData['Pallet_Type'] == 'Opt', df_InputData['Pallet_Opt'], df_InputData['Output_CaseRoundQty']))
+        #MROUND logic
+    def mround(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.round(x / base)
+    df_InputData['Pall_TargetQty'] = df_InputData.apply(lambda row: mround(row['Output_CaseRoundQty'], row['Pall_Constraint']), axis=1)
+        #Baseline Round Decision
+    df_InputData['Available_Excess'] = np.where(df_InputData['Output_CaseRoundQty'] == 0, 0, df_InputData['ItemMOQ/V_TotalStep1'] - df_InputData['Item_Constraint_Used'])
+    df_InputData['Baseline_PallQty_Round'] = np.where(df_InputData['Output_CaseRoundQty'] == 0, 0, df_InputData['Pall_TargetQty'] - df_InputData['Output_CaseRoundQty'])
+    df_InputData['Pallet_RoundDecision'] = np.where(df_InputData['Output_CaseRoundQty'] == 0, 'No Change', np.where(df_InputData['Baseline_PallQty_Round'] == 0, 'No Change', 
+                                                np.where((df_InputData['Pallet_Type'] == 'Opt') & ((df_InputData['Baseline_PallQty_Round'] / df_InputData['Output_CaseRoundQty']) > .25), 'No Change',
+                                                         np.where(-df_InputData['Baseline_PallQty_Round'] > df_InputData['Available_Excess'], 'Round Up', 'Round'))))
+    def roundup(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.ceil(x / base)
+    df_InputData['Output_PalletQtyV1'] = np.where(df_InputData['Pallet_RoundDecision'] == 'No Change', df_InputData['Output_CaseRoundQty'],
+                                                  np.where(df_InputData['Pallet_RoundDecision'] == 'Round', df_InputData['Output_CaseRoundQty'] + df_InputData['Baseline_PallQty_Round'],
+                                                           df_InputData.apply(lambda row: roundup(row['Output_CaseRoundQty'], row['Pall_Constraint']), axis=1)))
+
+#Calculate number of pallets and if there is excess that needs to be removed
+    df_InputData['PallQty_TotalOriginal'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum')
+    df_InputData['PallQty_TotalV1'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_PalletQtyV1'].transform('sum')
+    
+    df_InputData['PallQty_TotalOriginal'] = df_InputData.apply(lambda row: mround(row['PallQty_TotalOriginal'], row['Pall_Constraint']), axis=1)
+    df_InputData['PallQty_TotalV1'] = df_InputData.apply(lambda row: mround(row['PallQty_TotalV1'], row['Pall_Constraint']), axis=1)
+    df_InputData['PallQty_NetAdjustment'] = np.where(df_InputData['Pallet_RoundDecision'] == 'Round Up', 0, df_InputData['PallQty_TotalOriginal'] - df_InputData['PallQty_TotalV1'])
+    df_InputData['PallQty_NetAdjustment_Count'] = np.where(df_InputData['Pall_Constraint'] == 0, 0, df_InputData['PallQty_NetAdjustment'] / df_InputData['Pall_Constraint'])
+        #FC Rank for add / remove
+    df_InputData['Output_PalletQtyV1_rand'] = np.where(df_InputData['Output_PalletQtyV1'] == 0, 0, df_InputData['Output_PalletQtyV1'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    df_InputData['FC_OrderRank'] = np.where(df_InputData['Output_PalletQtyV1_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_PalletQtyV1_rand'].rank(method='dense', ascending=False))
+    #df_InputData['PallQty_NetAdjustment_Count'] = -2 #Used for testing outputs given excess round required
+    df_InputData['ExcessNetPallet_Adjust'] = np.where(df_InputData['FC_OrderRank'] > np.absolute(df_InputData['PallQty_NetAdjustment_Count']), 0,
+                                                      np.where(df_InputData['PallQty_NetAdjustment_Count'] < 0, -df_InputData['Pall_Constraint'], df_InputData['Pall_Constraint']))
+
+#Final Output and Dropping Columns
+    df_InputData['Item_Pallet_TotalRound'] = (df_InputData['Output_PalletQtyV1'] + df_InputData['ExcessNetPallet_Adjust']) - df_InputData['Output_CaseRoundQty']
+    df_InputData['Output_ItemPalletQty'] = df_InputData['Output_PalletQtyV1'] + df_InputData['ExcessNetPallet_Adjust']
+    df_InputData['Output_ItemPalletCost'] = df_InputData['Output_ItemPalletQty'] * df_InputData['FIFOAVERAGECOST']
+    df_InputData['Output_ItemPalletCost'].fillna(0, inplace=True)
+    df_InputData['Output_ItemPalletQty'].fillna(0, inplace=True)
+
+    df_InputData = df_InputData.rename(columns={'Pallet_Type': 'Item_Pallet_Type'}) #Old Name, New Name
+    df_InputData = df_InputData.rename(columns={'Pall_Constraint': 'Item_Pallet_Constraint'}) #Old Name, New Name
+    df_InputData = df_InputData.drop(columns=['Pallet_Req', 'Pallet_Opt', 'ItemMOQ/V_TotalStep1', 'Pall_TargetQty', 'Available_Excess','Baseline_PallQty_Round', 'Pallet_RoundDecision', 'Output_PalletQtyV1', 'PallQty_TotalOriginal', 'PallQty_TotalV1', 'PallQty_NetAdjustment', 'PallQty_NetAdjustment_Count', 'Output_PalletQtyV1_rand', 'FC_OrderRank', 'ExcessNetPallet_Adjust'])
+                            
+#Generate Output Table
+    #df_InputData['Last Modified']= datetime.now()
+    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.ER_ordering_sim_ItemPallet') 
+    
+#Optional View Output
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == 23319);
+
+################
+#END OF ITEM PALLET
+################
+
+################
+#START OF BRAND MOV
+################
+
+#Gather Constraint Data
+        #Temporary Constraint Table
+    Constraints = 'INVENTORYSANDBOX.DBO.IB_CONSTRAINTS'
+        #Create & Filter Output (Item & Brand Options)
+    df_ItemConstraints = session.table(Constraints).filter(col("Level") == 'Brand')
+        #Covert to Pandas
+    df_ItemConstraints = df_ItemConstraints.to_pandas()
+        #Rename Order Type Column
+    df_ItemConstraints['ORDERTYPE'] = df_ItemConstraints['ORDER_TYPE']
+        #Remove Excess Columns
+    df_ItemConstraints = df_ItemConstraints[['SUPPLIERID', 'ORDERTYPE', 'C7', 'C8']]
+    df_ItemConstraints = df_ItemConstraints.rename(columns={'C7': 'MOV_Ship'}) #Old Name, New Name
+    df_ItemConstraints = df_ItemConstraints.rename(columns={'C8': 'MOV_Mast'}) #Old Name, New Name
+    df_ItemConstraints['MOV_Ship'].fillna(0, inplace=True)
+    df_ItemConstraints['MOV_Mast'].fillna(0, inplace=True)
+    s = pd.Series(df_ItemConstraints['MOV_Ship'])
+    df_ItemConstraints['MOV_Ship'] = pd.to_numeric(s, errors='coerce')
+    t = pd.Series(df_ItemConstraints['MOV_Mast'])
+    df_ItemConstraints['MOV_Mast'] = pd.to_numeric(t, errors='coerce')
+    del s
+    del t
+    df_ItemConstraints['Brand_MOV_Type'] = np.where(df_ItemConstraints['MOV_Ship'] > 0, 'Ship', np.where(df_ItemConstraints['MOV_Mast'] > 0, 'Mast', 'None'))
+    df_ItemConstraints['Brand_MOV_Used'] = np.where(df_ItemConstraints['MOV_Ship'] > 0, df_ItemConstraints['MOV_Ship'], np.where(df_ItemConstraints['MOV_Mast'] > 0, df_ItemConstraints['MOV_Mast'], 0))
+        #Optional - Return Output
+    #df_ItemConstraints = session.create_dataframe(df_ItemConstraints)
+    #return df_ItemConstraints
+        #Merge with existing dataset
+    df_InputData = pd.merge(df_InputData, df_ItemConstraints, how='left', on=['ORDERTYPE', 'SUPPLIERID'])
+    df_InputData['Brand_MOV_Type'].fillna('None', inplace=True)
+    df_InputData['MOV_Ship'].fillna(0, inplace=True)
+    df_InputData['MOV_Mast'].fillna(0, inplace=True)
+    df_InputData['Brand_MOV_Used'].fillna(0, inplace=True)
+    #df_InputData['Brand_MOV_Used'] = 50000 #Used for testing different MOV values
+
+#Calculate Baseline MOV & Round Required
+    df_InputData['BrandMOV_TotalStep1'] = np.where(df_InputData['Brand_MOV_Type'] == 'Ship', df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_ItemPalletCost'].transform('sum'),
+                                                    np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_ItemPalletCost'].transform('sum'), 99999.99))
+    df_InputData['MOV_RequiredRoundUp'] = np.where(df_InputData['BrandMOV_TotalStep1'] == 0, 0, np.maximum(0, df_InputData['Brand_MOV_Used'] - df_InputData['BrandMOV_TotalStep1']))
+        #Helper Columns
+    df_InputData['MOV_NetRoundup'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RequiredRoundUp'].transform('sum')
+    df_InputData['MOV_NetTotal'] = np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData['BrandMOV_TotalStep1'], df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1'].transform('sum'))
+    df_InputData['MOV_NetMaxRoundup'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RequiredRoundUp'].transform('max')
+    df_InputData['MOV_NetOrderCount'] = np.where(df_InputData['MOV_NetTotal'] == 0, 9999, np.round(df_InputData['MOV_NetTotal'] / df_InputData['Brand_MOV_Used'], 0))
+    df_InputData['BrandMOV_TotalStep1_rand'] = np.where(df_InputData['BrandMOV_TotalStep1'] == 0, 0, df_InputData['BrandMOV_TotalStep1'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    df_InputData['MOV_FC_OrderRank'] = np.where(df_InputData['BrandMOV_TotalStep1_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1_rand'].rank(method='dense', ascending=False))
+        #Round Up Decision V1
+    df_InputData['Baseline_Round_Decision_V1'] = np.where((df_InputData['MOV_NetRoundup'] == 0) | (df_InputData['MOV_RequiredRoundUp'] == 0), 'Normal',
+                                                       np.where(df_InputData['BrandMOV_TotalStep1'] < (df_InputData['MOV_NetMaxRoundup'] * .25), 'Redistribute',
+                                                                np.where((df_InputData['MOV_NetOrderCount'] >= 5) & ((df_InputData['MOV_RequiredRoundUp'] / df_InputData['MOV_NetTotal']) > .075), 'Redistribute',
+                                                                         np.where(df_InputData['MOV_FC_OrderRank'] > df_InputData['MOV_NetOrderCount'], 'Redistribute', 'Normal'))))
+        #Normal Count Helper Column Used in Decision V2 
+    NormalCount = df_InputData[df_InputData['Baseline_Round_Decision_V1'] == 'Normal']
+    NormalCount = NormalCount[['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC']]
+    NormalCount = NormalCount.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).count()
+    NormalCount = NormalCount.rename(columns={'FC': 'Normal_Count'})
+    df_InputData = pd.merge(df_InputData, NormalCount, how='left', on=['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    del NormalCount
+        #Round Up Decision V2
+    df_InputData['Normal_Count'].fillna(0, inplace=True)
+    df_InputData['MOV_Round_Decision'] = np.where((df_InputData['BrandMOV_TotalStep1'] > (df_InputData['MOV_NetMaxRoundup'] * .4)) & (df_InputData['Brand_MOV_Type'] == 'Mast'), 'Normal',
+                                                          np.where((df_InputData['Normal_Count'] == 0) & (df_InputData['MOV_FC_OrderRank'] <= df_InputData['MOV_NetOrderCount']), 'Normal', df_InputData['Baseline_Round_Decision_V1']))
+        #Drop Helper Columns
+    df_InputData = df_InputData.drop(columns=['MOV_NetRoundup', 'MOV_NetTotal', 'MOV_NetMaxRoundup', 'MOV_NetOrderCount', 'BrandMOV_TotalStep1_rand', 'MOV_FC_OrderRank', 'Baseline_Round_Decision_V1', 'Normal_Count'])
+
+#Redistribution Logic (All or Nothing Given Previous Steps Complete)
+        #Redistribution Table Query
+    Redistribution = """
+            Select
+                FC,
+                SEA, LAS, LNK, DFW, IND, AVP, SAV, ONT
+                from INVENTORYSANDBOX.DBO.ER_REDISTRIBUTIONTABLE
+            """
+    Redistribution = session.sql(Redistribution)
+    Redistribution = Redistribution.to_pandas()
+    df_InputData = pd.merge(df_InputData, Redistribution, how='left', on=['FC']) 
+    
+        #Pull Rounding Decision for other FCs to remove from Redistribution %'s
+    fc_values = ['WA', 'NV', 'NE', 'TX', 'IN', 'PA', 'GA']
+    def get_other_decision(row, fc):
+        key_tuple = (row['ITEMID'], fc, row['SUPPLIERID'], row['UPDATED_ORDERTYPE'], row['OTF'], row['LT'], row['CAP_DOS'])
+        return decision_map.get(key_tuple)
+        #Round Decision
+    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_Round_Decision'].to_dict()
+    for fc in fc_values:
+        df_InputData[f'{fc}_RoundDecision'] = df_InputData.apply(get_other_decision, axis=1, fc=fc)
+        #Total Order Qty
+    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1'].to_dict()
+    for fc in fc_values:
+        df_InputData[f'{fc}_MOVTotal'] = df_InputData.apply(get_other_decision, axis=1, fc=fc)
+        
+        #Remove blank & Redistribute Values from Redistribution Values
+    df_InputData['SEA'] = np.where((df_InputData['WA_RoundDecision'] != 'Normal') | (df_InputData['WA_MOVTotal'] == 0), 0, df_InputData['SEA'])
+    df_InputData['LAS'] = np.where((df_InputData['NV_RoundDecision'] != 'Normal') | (df_InputData['NV_MOVTotal'] == 0), 0, df_InputData['LAS'])
+    df_InputData['LNK'] = np.where((df_InputData['NE_RoundDecision'] != 'Normal') | (df_InputData['NE_MOVTotal'] == 0), 0, df_InputData['LNK'])
+    df_InputData['DFW'] = np.where((df_InputData['TX_RoundDecision'] != 'Normal') | (df_InputData['TX_MOVTotal'] == 0), 0, df_InputData['DFW'])
+    df_InputData['IND'] = np.where((df_InputData['IN_RoundDecision'] != 'Normal') | (df_InputData['IN_MOVTotal'] == 0), 0, df_InputData['IND'])
+    df_InputData['AVP'] = np.where((df_InputData['PA_RoundDecision'] != 'Normal') | (df_InputData['PA_MOVTotal'] == 0), 0, df_InputData['AVP'])
+    df_InputData['SAV'] = np.where((df_InputData['GA_RoundDecision'] != 'Normal') | (df_InputData['GA_MOVTotal'] == 0), 0, df_InputData['SAV'])
+    df_InputData['ONT'] = 0
+
+        #Final Redistribution FC Assignment
+    columns_to_consider = ['SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']
+    df_InputData['Max_FC_Percent'] = df_InputData[columns_to_consider].max(axis=1)
+    df_InputData['Redistribution_FC'] = np.where(df_InputData['Max_FC_Percent'] == df_InputData['IND'], 'IND',
+                                                 np.where(df_InputData['Max_FC_Percent'] == df_InputData['LAS'], 'LAS',
+                                                 np.where(df_InputData['Max_FC_Percent'] == df_InputData['LNK'], 'LNK',
+                                                 np.where(df_InputData['Max_FC_Percent'] == df_InputData['DFW'], 'DFW',
+                                                 np.where(df_InputData['Max_FC_Percent'] == df_InputData['SEA'], 'SEA',
+                                                 np.where(df_InputData['Max_FC_Percent'] == df_InputData['AVP'], 'AVP',
+                                                 np.where(df_InputData['Max_FC_Percent'] == df_InputData['SAV'], 'SAV',
+                                                 np.where(df_InputData['Max_FC_Percent'] == df_InputData['ONT'], 'ONT', 'IND'))))))))
+        #Drop All Helper Columns
+    df_InputData = df_InputData.drop(columns=['SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT', 'WA_RoundDecision', 'NV_RoundDecision', 'NE_RoundDecision', 'TX_RoundDecision', 'IN_RoundDecision', 'PA_RoundDecision', 'GA_RoundDecision', 'WA_MOVTotal', 'NV_MOVTotal', 'NE_MOVTotal', 'TX_MOVTotal', 'IN_MOVTotal', 'PA_MOVTotal', 'GA_MOVTotal', 'Max_FC_Percent'])
+        #Aggregate for final add to order qty
+    RedistQty = df_InputData[df_InputData['MOV_Round_Decision'] == 'Redistribute']
+    RedistQty = RedistQty[['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistribution_FC', 'BrandMOV_TotalStep1', 'Output_ItemPalletQty']]
+    RedistQty = RedistQty.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistribution_FC'], as_index=False).sum()
+    RedistQty = RedistQty.rename(columns={'BrandMOV_TotalStep1': 'MOVRedist_Final'})
+    RedistQty = RedistQty.rename(columns={'Redistribution_FC': 'FC_CODE'})
+    RedistQty = RedistQty.rename(columns={'Output_ItemPalletQty': 'OrderQty_RedistFinal'})
+    RedistQty['ITEMID'] = RedistQty['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, RedistQty, how='left', on=['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC_CODE'])
+    del RedistQty
+        #Total MOV V2
+    df_InputData['MOVRedist_Final'].fillna(0, inplace=True)
+    df_InputData['OrderQty_RedistFinal'].fillna(0, inplace=True)
+    df_InputData['BrandMOV_TotalStep2'] = np.where(df_InputData['MOV_Round_Decision'] == 'Redistribute', 0, df_InputData['BrandMOV_TotalStep1'] + df_InputData['MOVRedist_Final'])
+    df_InputData['BrandMOV_OrderQtyStep1'] = np.where(df_InputData['MOV_Round_Decision'] == 'Redistribute', 0, df_InputData['Output_ItemPalletQty'] + df_InputData['OrderQty_RedistFinal'])
+    df_InputData = df_InputData.drop(columns=['BrandMOV_TotalStep1', 'OrderQty_RedistFinal', 'MOVRedist_Final'])
+    df_InputData['BrandMOV_OrderCostStep1'] = df_InputData['BrandMOV_OrderQtyStep1'] * df_InputData['FIFOAVERAGECOST']
+
+#Round up Required & FC / Item Distribution
+    df_InputData['MOV_RequiredRoundUpV2'] = np.where(df_InputData['BrandMOV_TotalStep2'] == 0, 0, np.maximum(0, df_InputData['Brand_MOV_Used'] - df_InputData['BrandMOV_TotalStep2']))
+    df_InputData['MOV_OrderPercent'] = np.where(df_InputData['BrandMOV_TotalStep2'] == 0, 0, df_InputData['BrandMOV_OrderCostStep1'] / df_InputData['BrandMOV_TotalStep2'])
+    
+    
+    df_InputData['MOV_RoundUnits'] = np.round(((df_InputData['MOV_OrderPercent'] * df_InputData['MOV_RequiredRoundUpV2']) / df_InputData['FIFOAVERAGECOST']) / 
+                                              np.where(df_InputData['Item_Pallet_Type'] == 'Req', df_InputData['Item_Pallet_Constraint'], 1), 0) * np.where(df_InputData['Item_Pallet_Type'] == 'Req', df_InputData['Item_Pallet_Constraint'], 1)
+    df_InputData['MOV_RoundCost'] = df_InputData['MOV_RoundUnits'] * df_InputData['FIFOAVERAGECOST']
+    df_InputData['MOV_ReqRoundMissing'] = df_InputData['MOV_RequiredRoundUpV2'] - np.where(df_InputData['Brand_MOV_Type'] == 'Ship', df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RoundCost'].transform('sum'),
+                                                    np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RoundCost'].transform('sum'), 0))
+    df_InputData['MOV_OrderPercentAvail_Ship'] = df_InputData[df_InputData['MOV_RoundCost'] > 0].groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_OrderPercent'].transform('sum')
+    df_InputData['MOV_OrderPercentAvail_Mast'] = df_InputData[df_InputData['MOV_RoundCost'] > 0].groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_OrderPercent'].transform('sum')
+    df_InputData['MOV_OrderPercentFinal'] = (df_InputData['MOV_OrderPercent'] / np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData['MOV_OrderPercentAvail_Mast'], df_InputData['MOV_OrderPercentAvail_Ship']))
+    
+    df_InputData['MOV_ReqRoundAdd'] = np.where(df_InputData['MOV_RoundCost'] == 0, 0, df_InputData['MOV_OrderPercentFinal'] * df_InputData['MOV_ReqRoundMissing']) * 1.05
+    df_InputData['MOV_ReqRoundAdd_Pallet'] = np.round(((df_InputData['MOV_OrderPercentFinal'] * df_InputData['MOV_ReqRoundAdd']) / df_InputData['FIFOAVERAGECOST']) / 
+                                                      np.where(df_InputData['Item_Pallet_Type'] == 'Req', df_InputData['Item_Pallet_Constraint'], 1), 0) * np.where(df_InputData['Item_Pallet_Type'] == 'Req', df_InputData['Item_Pallet_Constraint'], 1)
+    df_InputData['MOV_ReqRoundAdd_Pallet'].fillna(0, inplace=True)
+#Final Total Round & Output
+    df_InputData['Output_BrandMOVQty'] = df_InputData['MOV_ReqRoundAdd_Pallet'] + df_InputData['MOV_RoundUnits'] + df_InputData['BrandMOV_OrderQtyStep1']
+    df_InputData['Output_BrandMOVCost'] = df_InputData['Output_BrandMOVQty'] * df_InputData['FIFOAVERAGECOST']
+    df_InputData['Output_BrandMOVQty'].fillna(0, inplace=True)
+    df_InputData['Output_BrandMOVCost'].fillna(0, inplace=True)
+
+    df_InputData = df_InputData.drop(columns=['MOV_Mast', 'MOV_Ship', 'MOV_RequiredRoundUp', 'MOV_Round_Decision', 'Redistribution_FC','BrandMOV_TotalStep2', 'BrandMOV_OrderQtyStep1', 'BrandMOV_OrderCostStep1', 'MOV_RequiredRoundUpV2', 'MOV_OrderPercent', 'MOV_RoundCost', 'MOV_ReqRoundMissing', 'MOV_OrderPercentAvail_Mast', 'MOV_OrderPercentAvail_Ship', 'MOV_OrderPercentFinal', 'MOV_ReqRoundAdd'])
+
+#Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter((col("OTF") == 77) & (col("ORDERTYPE") == 'domestic'));
+
+################
+#END OF BRAND MOV
+################
+
+
+    
+#Generate Output Table
+    df_InputData['Last Modified']= datetime.now()
+
+    # Adjust Warehouse Size
+    session.sql("ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'MEDIUM'").collect()
+
+    iteration_count = df_InputData['RFP_ITERATION_COUNT'].iloc[0]
+
+    if iteration_count == 1:
+        session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_IB_optimizationV2')
+    else:
+        session.create_dataframe(df_InputData).write.mode("append").saveAsTable('inventorysandbox.DBO.RFP_Simulation_IB_optimizationV2')
+
+#Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter((col("OTF") == 77) & (col("ORDERTYPE") == 'domestic'));
+
+    #Call Following Step
+    #session.sql("CALL inventorysandbox.DBO.AOG4_Test()").collect()
+
+
+    return(session.create_dataframe([1]))
