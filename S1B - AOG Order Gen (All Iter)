@@ -1,0 +1,350 @@
+#Python Code Created by: Erik R
+#Code Last Updated: 3/26/2025 @ 10:00am
+#Procedure Name: Step_1B_RFPGen_Simulation
+#Code Guide Avail Here:
+
+#To Do
+#9/27/2024 - Update the cap DoS logic
+#9/27/2024 - Add RFP Order PredictedQoH starting at T + 21
+
+#Update Notes:
+#10/10/2024 - Unique from iteration 1, OTF query and updated unmet
+#10/21/2024 - Updated OTF & LT link to add the previously covered dates to the total output
+#12/09/2024 - Updated logic to consolidate steps 1 and 3 together to remove the need for two worksheets and optimize the code run flow
+#12/30/2024 - Updated lead time to round to 7 days for testing; this is how AROB does it but not something we'd want to permanently change
+#01/01/2025 - Add annual FCST to output for calculation of SS seasonality
+#03/26/2025 - Updated the case pack rounding logic to be 1 only
+
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.functions import (
+    col, sum as sum_, max as max_, min as min_, avg, count, lit,
+    when, greatest, least, coalesce, dateadd, to_date, date_add,
+    round as snow_round, current_timestamp, sum, current_date
+)
+from snowflake.snowpark.window import Window
+from datetime import datetime
+
+def main(session: snowpark.Session):
+
+    # Adjust Warehouse Size
+    session.sql("ALTER WAREHOUSE IBOPTIMIZATION_WH SET WAREHOUSE_SIZE = 'XLARGE'").collect()
+
+    # Gather Key Data Points
+    # Basic Item Data Query Source
+    ItemData = """
+     WITH ITEM_LIST as (
+    SELECT * FROM inventorysandbox.dbo.RFP_Sim_ItemList WHERE ITEMID IS NOT NULL --AND ITEMID <> 'NULL' --AND SUPPLIERID <> 'NULL'
+    )
+    
+    , OTF_ADD as (
+      Select sim.SUPPLIERID, sim.ORDERTYPE, CASE WHEN MAX("Iteration") = 1 THEN 1 ELSE Dec.RFP_ITERATION_COUNT END as RFP_ITERATION_COUNT, CASE WHEN MAX("Iteration") = 1 THEN 0 ELSE MAX(Dec.OTF) - 14 END as OTF_Add
+        FROM inventorysandbox.dbo.ER_TEMP_OTF_RFP sim
+        LEFT JOIN inventorysandbox.dbo.RFP_OrderDecision Dec on Dec.SUPPLIERID = sim.SUPPLIERID AND Dec.ORDERTYPE = sim.ORDERTYPE
+        LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
+        WHERE sim.OTF < 77 --AND sim.SUPPLIERID <> 'NULL'
+        GROUP BY sim.SUPPLIERID, sim.ORDERTYPE, Dec.RFP_ITERATION_COUNT
+    )
+    
+    , TOTAL_OTF_ADD as (
+        Select SUPPLIERID, ORDERTYPE, SUM(OTF_Add) as Total_Add
+        FROM OTF_ADD
+        GROUP BY SUPPLIERID, ORDERTYPE
+    )
+
+    , OTF_SIM_SETUP as (
+    Select * from inventorysandbox.dbo.ER_TEMP_OTF_RFP WHERE OTF < 77 --AND SUPPLIERID <> 'NULL'
+    )
+
+    , OTF_LT_Values as (
+    SELECT 
+        OTF.SUPPLIERID,
+        OTF.ORDERTYPE,
+        OTF.OTF_TYPE,
+        OTF.LT_TYPE,
+        OTF.CURRENT_DATE_USED,
+        OTF.CURRENT_DATE_USED_SS,
+        CASE WHEN "Iteration" = 1 THEN 0 ELSE ((OTF.OTF + (dec.OTF - 14)) - dec.OTF) / 7 END as ITERATION_COUNT,
+        OTF.OTF - 7 as OTF,
+        (round(greatest(1, OTF.LT / 7), 0) * 7) + Total_Add as LT,
+        CASE WHEN "Iteration" = 1 THEN 0 ELSE dec.RFP_ITERATION_COUNT END as RFP_ITERATION_COUNT
+    FROM OTF_SIM_SETUP OTF
+    LEFT JOIN (Select MAX(ITERATION_COUNT) as MAX_ITERATION_COUNT FROM inventorysandbox.dbo.RFP_IB_optimization) MAXCOUNT
+    LEFT JOIN (Select SUPPLIERID, ORDERTYPE, max(OTF) as OTF, max(LT) as LT, MAX(RFP_ITERATION_COUNT) as RFP_ITERATION_COUNT 
+            FROM inventorysandbox.dbo.RFP_OrderDecision 
+            LEFT JOIN (Select max(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_OrderDecision) as MAXCOUNT
+            WHERE RFP_ITERATION_COUNT = MAX_COUNT
+            GROUP BY SUPPLIERID, ORDERTYPE) dec on dec.SUPPLIERID = OTF.SUPPLIERID AND dec.ORDERTYPE = OTF.ORDERTYPE
+    LEFT JOIN TOTAL_OTF_ADD ADD on ADD.SUPPLIERID = OTF.SUPPLIERID AND ADD.ORDERTYPE = OTF.ORDERTYPE
+    LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
+    WHERE (OTF.OTF + (round(greatest(1, OTF.LT / 7), 0) * 7) + IFNULL(Total_Add, 365)) <= 360
+    -- AND OTF.SUPPLIERID = 386
+    )
+
+    , PRED_QOH as (
+    SELECT his.ITEMID, his.STATE AS FC, DATEVALUE, DAYSFROMTODAY, NODEQOH, 
+           his.TOTALRECEIPT AS QOO, FORECAST, FINAL_FORECAST_USED, 
+           UNMETDEMAND, ENDING_PREDICTIVEQOH as ENDING_PREDICTEDQOH
+    FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT his
+    LEFT JOIN lakehouse.spreedw_dim.product prod ON prod.itemid = his.itemid
+    WHERE prod.PROCUREMENTSTATUS = 'Replenish' 
+      AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish' 
+      AND his.datevalue <= (current_date() + 365)
+      -- AND prod.ITEMID <> 'NULL' 
+      -- AND prod.ITEMID = 183880
+      -- AND prod.SUPPLIERID = 368
+    )
+
+    , ANNUAL_DEMAND as (
+    Select
+        ITEMID,
+        STATE,
+        SUM(FORECAST) as ANNUAL_DEMAND,
+        SUM(TOTALRECEIPT) as ANNUAL_TOTALRECEIPT
+    FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT
+    WHERE datevalue <= (current_date() + 365)
+    -- AND ITEMID = 324324
+    GROUP BY ITEMID, STATE
+    )
+
+    SELECT
+    ITEM_LIST.ITEMID,
+    ITEM_LIST.SUPPLIERID,
+    OTF_LT_Values.ORDERTYPE,
+    OTF_LT_Values.OTF,
+    OTF_LT_Values.LT,
+    OTF_LT_Values.LT_TYPE,
+    OTF_LT_Values.OTF_TYPE,
+    ITEM_LIST.CASEQUANTITY,
+    ITEM_LIST.PROCUREMENTSTATUS,
+    ITEM_LIST.CURRENTSUPPLIERPROCUREMENTSTATUS,
+    OTF_LT_Values.RFP_ITERATION_COUNT,
+    OTF_LT_Values.ITERATION_COUNT,
+    OTF_LT_Values.LT + current_date as LT_DATE,
+    OTF_LT_Values.LT + OTF_LT_Values.OTF + current_date as OTF_DATE,
+    OTF_LT_Values.LT + OTF_LT_Values.OTF + current_date as CAP_DATE,
+    OTF_LT_Values.OTF as CAP_DOS,
+    OTF_LT_Values.LT + OTF_LT_Values.OTF + 14 + current_date as SAFETYSTOCK_DATE,
+    PRED_QOH.FC,
+    PRED_QOH.DATEVALUE,
+    PRED_QOH.DAYSFROMTODAY,
+    PRED_QOH.NODEQOH,
+    PRED_QOH.QOO,
+    PRED_QOH.FORECAST,
+    PRED_QOH.FINAL_FORECAST_USED,
+    PRED_QOH.UNMETDEMAND,
+    PRED_QOH.ENDING_PREDICTEDQOH,
+    ANNUAL_DEMAND.ANNUAL_DEMAND,
+    ANNUAL_DEMAND.ANNUAL_TOTALRECEIPT
+    
+    FROM ITEM_LIST
+    INNER JOIN OTF_LT_Values on OTF_LT_Values.SUPPLIERID = ITEM_LIST.SUPPLIERID
+    INNER JOIN PRED_QOH on try_cast(PRED_QOH.ITEMID as int) = try_cast(ITEM_LIST.ITEMID as int)
+    LEFT JOIN ANNUAL_DEMAND on ANNUAL_DEMAND.ITEMID = ITEM_LIST.ITEMID AND ANNUAL_DEMAND.STATE = PRED_QOH.FC
+    INNER JOIN (With Setup as (Select ITEMID, INVENTORYSTATUS, CASE WHEN INVENTORYSTATUS = 'Import - Domestic Available' THEN 'Y' WHEN INVENTORYSTATUS like '%Import%' THEN 'Y' ELSE 'N' END as IMPORT_ITEM, 
+                CASE WHEN INVENTORYSTATUS = 'Import - Domestic Available' THEN 'N' WHEN INVENTORYSTATUS like '%Domestic%' THEN 'Y' ELSE 'N' END as DOMESTIC_ITEM
+                from lakehouse.spreedw_dim.product) Select ITEMID, CASE WHEN (IMPORT_ITEM = 'N' AND DOMESTIC_ITEM = 'N') THEN 'domestic' WHEN IMPORT_ITEM = 'Y' THEN 'import' ELSE 'domestic' END as ORDERTYPE FROM Setup
+                ) IMP_DOM_STATUS on IMP_DOM_STATUS.ITEMID = ITEM_LIST.ITEMID AND IMP_DOM_STATUS.ORDERTYPE = OTF_LT_Values.ORDERTYPE
+    WHERE PRED_QOH.DATEVALUE <= (OTF_LT_Values.LT + OTF_LT_Values.OTF + current_date + 21)
+    """
+    df_ItemData = session.sql(ItemData)#.filter(col("ITEMID") == '81495')
+    # return df_ItemData.filter((col("OTF") == 14) & (col("ORDERTYPE") == 'domestic'))
+
+    # Generate Lead Time Values (Total & After LT)
+    df_ItemPred = df_ItemData.withColumn('FINAL_FORECAST_USED', col('FINAL_FORECAST_USED').cast('double'))
+
+#Add Updated Unmet Demand - Only Required for Iteration 2+
+    RFP_PredQoH = """
+    Select DISTINCT ITEMID, DATEVALUE, FC, ORDERTYPE, UPDATED_UNMET, "Iteration"
+    from inventorysandbox.dbo.RFP_PredictedQoHV2
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_PredictedQoHV2) MAXCOUNT
+        LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
+    WHERE RFP_ITERATION_COUNT = MAX_COUNT
+                   """
+    df_RFP_PredQoH = session.sql(RFP_PredQoH)
+    #df_RFP_PredQoH = pd.DataFrame(df_RFP_PredQoH)
+    df_ItemPred = df_ItemPred.join(df_RFP_PredQoH, on=['ITEMID', 'DATEVALUE', 'FC', 'ORDERTYPE'], how="left")
+    df_ItemPred = df_ItemPred.with_column('UNMETDEMAND', when(col('"Iteration"') == 1, col('UNMETDEMAND')).otherwise(coalesce(col('UPDATED_UNMET'), col('UNMETDEMAND'))))
+    df_ItemPred = df_ItemPred.drop('UPDATED_UNMET')
+    del df_RFP_PredQoH
+
+    # return df_ItemPred.filter((col("OTF") == 14) & (col("ORDERTYPE") == 'domestic'))
+    # Extra Required Columns using Window Functions
+    w = Window.partitionBy('ITEMID', 'FC', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    df_ItemPred = df_ItemPred.withColumn('FC_QoH', sum_(col('NODEQOH')).over(w)
+        ).withColumn('FC_FCST', col('ANNUAL_DEMAND')
+        ).withColumn('FC_QOO', col('ANNUAL_TOTALRECEIPT'))
+
+    w_net_fcst = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    df_ItemPred = df_ItemPred.withColumn('NET_FCST', sum_(col('FORECAST')).over(w_net_fcst)
+        ).drop('NODEQOH', 'QOO', 'ANNUAL_TOTALRECEIPT', 'ANNUAL_DEMAND')
+
+    # Total LT Values
+    df_ItemPred = df_ItemPred.withColumn('LT_Unmet', sum_(when(col('DATEVALUE') <= col('LT_Date'), col('UNMETDEMAND')).otherwise(0)).over(w)
+        ).withColumn('LT_FCST', sum_(when(col('DATEVALUE') <= col('LT_Date'), col('FORECAST')).otherwise(0)).over(w)
+        ).withColumn('LT_Final_FCST', sum_(when(col('DATEVALUE') <= col('LT_Date'), col('FINAL_FORECAST_USED')).otherwise(0)).over(w))
+
+    # Generate Order Time Frame Values (Total OTF, Max OTF & After OTF)
+    df_ItemPred = df_ItemPred.withColumn('OTF_FCST', sum_(when((col('DATEVALUE') <= col('OTF_Date')) & (col('DATEVALUE') > col('LT_Date')), col('FORECAST')).otherwise(0)).over(w)
+        ).withColumn('OTF_Final_FCST', sum_(when((col('DATEVALUE') <= col('OTF_Date')) & (col('DATEVALUE') > col('LT_Date')), col('FINAL_FORECAST_USED')).otherwise(0)).over(w))
+
+    # return df_ItemPred
+
+    # Join predicted QoH for OTF time period
+    df_OTFPredQoH = session.sql("""
+    With PreSetup as (
+            Select ITEMID, state as FC, DATEVALUE FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT WHERE DAYSFROMTODAY <= 365
+        )
+    
+        ,V1_Setup as (
+            Select ITEMID, FC, DATEVALUE, ORDERTYPE, PREDICTEDQOH FROM inventorysandbox.dbo.RFP_ordering_predQoH
+        )
+        
+        ,V2_Setup as (
+            SELECT ITEMID, FC, DATEVALUE, ORDERTYPE, PREDICTEDQOH FROM inventorysandbox.dbo.RFP_PredictedQoHV2
+        )
+        
+        ,Final_Setup as (
+            Select
+            PreSetup.ITEMID,
+            PreSetup.FC,
+            PreSetup.DATEVALUE,
+            CASE WHEN "Iteration" = 1 THEN V1Domestic.ORDERTYPE ELSE V2Domestic.ORDERTYPE END as ORDERTYPE,
+            CASE WHEN "Iteration" = 1 THEN V1Domestic.PREDICTEDQOH ELSE V2Domestic.PREDICTEDQOH END as PREDICTEDQOH,
+        FROM PreSetup
+        LEFT JOIN V1_Setup V1Domestic on V1Domestic.ITEMID = PreSetup.ITEMID AND V1Domestic.FC = PreSetup.FC AND V1Domestic.DATEVALUE = PreSetup.DATEVALUE --AND V1Domestic.ORDERTYPE = 'domestic'
+        LEFT JOIN V2_Setup V2Domestic on V2Domestic.ITEMID = PreSetup.ITEMID AND V2Domestic.FC = PreSetup.FC AND V2Domestic.DATEVALUE = PreSetup.DATEVALUE --AND V2Domestic.ORDERTYPE = 'domestic'
+        -- LEFT JOIN V1_Setup V1Import on V1Import.ITEMID = PreSetup.ITEMID AND V1Import.FC = PreSetup.FC AND V1Import.DATEVALUE = PreSetup.DATEVALUE AND V1Import.ORDERTYPE = 'import'
+        -- LEFT JOIN V2_Setup V2Import on V2Import.ITEMID = PreSetup.ITEMID AND V2Import.FC = PreSetup.FC AND V2Import.DATEVALUE = PreSetup.DATEVALUE AND V2Import.ORDERTYPE = 'import'
+
+        
+        LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
+        
+        )
+        
+        Select
+            DISTINCT FINAL_SETUP.*
+            -- ITEMID,
+            -- FC,
+            -- DATEVALUE,
+            -- ORDERTYPE,
+            -- MIN(PREDICTEDQOH) as PREDICTEDQOH
+        FROM FINAL_SETUP
+        WHERE ITEMID IS NOT NULL AND ORDERTYPE IS NOT NULL --AND ITEMID = 397885
+        -- GROUP BY ITEMID, FC, DATEVALUE, ORDERTYPE
+    """)
+    df_ItemPred = df_ItemPred.join(df_OTFPredQoH, on=['ITEMID', 'FC', 'DATEVALUE', 'ORDERTYPE'], how='left')
+
+    # OTF Unmet
+    w2 = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE', 'DATEVALUE')
+    w3 = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    
+    df_ItemPred = df_ItemPred.with_column('PREDICTEDQOH', coalesce(col('PREDICTEDQOH'), col('ENDING_PREDICTEDQOH')))
+    df_ItemPred = df_ItemPred.withColumn('OTF_Unmet_Setup', greatest(col('FORECAST') - col('PREDICTEDQOH'), lit(0))
+        ).withColumn('OTF_Unmet_Setup', coalesce(col('OTF_Unmet_Setup'), col('UNMETDEMAND'))
+        ).withColumn('OTF_Unmet', sum_(when((col('DATEVALUE') <= col('OTF_Date')) & (col('DATEVALUE') > col('LT_Date')), col('OTF_Unmet_Setup')).otherwise(0)).over(w)
+        ).withColumn('QoH_After_OTF', sum_(when(col('DATEVALUE') == col('OTF_Date'), col('PREDICTEDQOH')).otherwise(0)).over(w)
+        ).withColumn('Network_QoH', sum_(col('PREDICTEDQOH')).over(w2)
+        ).withColumn('Max_QoH_OTF', max_(when((col('DATEVALUE') <= col('OTF_Date')) & (col('DATEVALUE') >= date_add(col('LT_Date') , lit(-1))), col('Network_QoH')).otherwise(lit(0))).over(w3)
+        ).withColumn('QoH_After_LT', sum_(when(col('DATEVALUE') == col('LT_Date'), col('PREDICTEDQOH')).otherwise(0)).over(w))
+
+    # Generate Cap Values (Total Cap)
+    df_ItemPred = df_ItemPred.withColumn('CAP_FCST', sum_(when((col('DATEVALUE') < col('Cap_Date')) & (col('DATEVALUE') >= col('LT_Date')), col('FORECAST')).otherwise(0)).over(w))
+
+    # Generate Safety Stock Values (Total Safety Stock Demand)
+    df_ItemPred = df_ItemPred.withColumn('SS_FCST', sum_(when((col('DATEVALUE') >= col('Cap_Date')) & (col('DATEVALUE') < col('SafetyStock_Date')), col('FORECAST')).otherwise(0)).over(w))
+
+    # Minimum Order Qty to Cover Network OOS
+    w_min = Window.partitionBy('ITEMID', 'DATEVALUE', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    df_ItemPred = df_ItemPred.withColumn('Net_QoH_Min', sum_(col('PREDICTEDQOH')).over(w_min)
+        ).withColumn('Net_QoH_Min', when((col('DATEVALUE') <= col('Cap_Date')) & (col('DATEVALUE') > col('LT_Date')), col('Net_QoH_Min')).otherwise(lit(999))
+        ).withColumn('Min_OTF_Req', max_(when(col('Net_QoH_Min') == 0, col('UNMETDEMAND')).otherwise(lit(0))).over(w))
+
+    # Aggregate and clean up
+    df_ItemPred = df_ItemPred.withColumn('OTF_Unmet', max_(col('OTF_Unmet')).over(w)
+        ).withColumn('OTF_FCST', max_(col('OTF_FCST')).over(w)
+        ).withColumn('OTF_Final_FCST', max_(col('OTF_Final_FCST')).over(w)
+        ).withColumn('QoH_After_OTF', max_(col('QoH_After_OTF')).over(w)
+        ).withColumn('CAP_FCST', max_(col('CAP_FCST')).over(w)
+        ).withColumn('SS_FCST', max_(col('SS_FCST')).over(w)
+        ).withColumn('Min_OTF_Req', max_(col('Min_OTF_Req')).over(w)
+        ).filter(col('DATEVALUE') == col('LT_Date')
+        ).drop('Net_QoH_Min', 'OTF_Unmet_Setup')
+
+    # Safety Stock Calculation using built-in functions
+    df_ItemPred = df_ItemPred.withColumn('MAX_LT', greatest(col('LT') + 7, least(lit(7) * snow_round(((col('LT') * 1.5) + 0.1) / lit(7)), col('LT') + 21)))
+
+    df_ItemPred = df_ItemPred.withColumn('SafetyStock_Baseline',
+        (((col('FC_FCST') / 365) * 1.2) * col('MAX_LT')) - ((col('FC_FCST') / 365) * col('LT'))
+        
+        ).withColumn('SafetyStock_Baseline', least(col('SafetyStock_Baseline'), (col('FC_FCST') / 365) * 14))
+
+    # Handle division by zero for 'FC_FCST' in 'SafetyStock_Adjustment'
+    df_ItemPred = df_ItemPred.withColumn('SafetyStock_Adjustment', when(col('FC_FCST') != 0, (col('SS_FCST') / col('FC_FCST')) / (14 / 365)).otherwise(0)
+        ).withColumn('SafetyStock', col('SafetyStock_Baseline') * col('SafetyStock_Adjustment')
+        ).withColumn('Zero', lit(0)
+        ).withColumn('SafetyStock_Ordered', greatest(col('Zero'), col('SafetyStock') - col('QoH_After_OTF')))
+
+    # Replace null or zero 'CASEQUANTITY' with 1
+    df_ItemPred = df_ItemPred.withColumn('CASEQUANTITY_NZ', lit(1)) #when(col('CASEQUANTITY').isNull() | (col('CASEQUANTITY') == 0), lit(1)).otherwise(col('CASEQUANTITY')))
+
+    # Baseline Order Qty
+    df_ItemPred = df_ItemPred.withColumn('BaselineOrderQty', col('CASEQUANTITY_NZ') * snow_round((col('SafetyStock_Ordered') + col('OTF_Unmet')) / col('CASEQUANTITY_NZ')))
+
+    # Max QoH Over OTF & Cap On Hand Used
+    w_item = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    df_ItemPred = df_ItemPred.withColumn('Net_CAP', sum_(col('CAP_FCST')).over(w_item) + sum_(col('SafetyStock')).over(w_item)
+        ).withColumn('Net_MaxQoHOTF', max_(col('Max_QoH_OTF')).over(w_item)
+        ).withColumn('Net_BaselineOrderQty', sum_(col('BaselineOrderQty')).over(w_item))
+
+    # Handle division by zero for 'Net_BaselineOrderQty' in 'Cap_OrderQtyV2'
+    df_ItemPred = df_ItemPred.withColumn('Cap_OrderQtyV1', greatest(col('Zero'), col('Net_CAP') - col('Net_MaxQoHOTF'))
+        ).withColumn('Cap_OrderQtyV2', when(col('Net_BaselineOrderQty') != 0, least(col('BaselineOrderQty'), (col('BaselineOrderQty') / col('Net_BaselineOrderQty')) * col('Cap_OrderQtyV1'))).otherwise(0)
+        ).withColumn('Cap_OrderQty_Used', when(col('Net_MaxQoHOTF') > 0, greatest(col('Cap_OrderQtyV2'), col('Min_OTF_Req'))).otherwise(col('Cap_OrderQtyV2'))
+        ).withColumn('Cap_OrderQty_Used', col('CASEQUANTITY_NZ') * snow_round(col('Cap_OrderQty_Used') / col('CASEQUANTITY_NZ'))
+        
+        )#.drop('Zero', 'LT_Date', 'OTF_Date', 'Cap_Date', 'SafetyStock_Date', 'DATEVALUE',
+               #'DAYSFROMTODAY', 'ENDING_PREDICTEDQOH', 'PREDICTEDQOH', 'SS_FCST',
+               #'Net_BaselineOrderQty', 'FORECAST', 'FINAL_FORECAST_USED', 'UNMETDEMAND')
+
+    # Generate Export Table
+    df_ItemPred = df_ItemPred.withColumn('Last Modified', current_timestamp()
+    ).withColumn('LASTMODIFIED', current_timestamp()
+    ).withColumn('ITERATION_COUNT', col('ITERATION_COUNT') + 1
+    #).withColumn('OTF', lit(21) + (col('MAX_ITERATION_COUNT') * 7)
+    #).withColumn('CAP_DOS', lit(28) + (col('MAX_ITERATION_COUNT') * 7)
+    ).drop('MAX_ITERATION_COUNT'
+    ).withColumn('RFP_ITERATION_COUNT', col('RFP_ITERATION_COUNT') + 1
+    ).drop('LT_Date', 'OTF_Date', 'Cap_Date', 'SafetyStock_Date'
+    ).select('ITEMID', 'FC', 'DATEVALUE', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE', 'SUPPLIERID', 'OTF', 'LT', 'CAP_DOS', 'CASEQUANTITY', 'PROCUREMENTSTATUS', 'CURRENTSUPPLIERPROCUREMENTSTATUS', 'DAYSFROMTODAY', 'FORECAST', 'UNMETDEMAND', 
+             'ENDING_PREDICTEDQOH', 'FINAL_FORECAST_USED', 'FC_QOH', 'FC_FCST', 'FC_QOO', 'NET_FCST', 'LT_UNMET', 'LT_FCST', 'LT_FINAL_FCST', 'QOH_AFTER_LT', 'PREDICTEDQOH', 'NETWORK_QOH', 'MAX_QOH_OTF', 'OTF_UNMET', 'OTF_FCST', 'OTF_FINAL_FCST', 
+             'QOH_AFTER_OTF', 'CAP_FCST', 'SS_FCST', 'MIN_OTF_REQ', 'MAX_LT', 'SAFETYSTOCK_BASELINE', 'SAFETYSTOCK_ADJUSTMENT', 'SAFETYSTOCK', 'ZERO', 'SAFETYSTOCK_ORDERED', 'CASEQUANTITY_NZ', 
+             'BASELINEORDERQTY', 'NET_CAP', 'NET_MAXQOHOTF', 'NET_BASELINEORDERQTY', 'CAP_ORDERQTYV1', 'CAP_ORDERQTYV2', 'CAP_ORDERQTY_USED', 'Last Modified', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT')
+
+    # Create final export table in database
+    # return df_ItemPred
+    iteration_count = df_ItemPred.select("RFP_ITERATION_COUNT").collect()[0][0]
+
+    if iteration_count == 1:
+        df_ItemPred.write.mode("overwrite").saveAsTable("inventorysandbox.dbo.RFP_ordering_sim")
+    else:
+        df_ItemPred.write.mode("append").saveAsTable("inventorysandbox.dbo.RFP_ordering_sim")
+
+    # # # Adjust Warehouse Size
+    session.sql("ALTER WAREHOUSE IBOPTIMIZATION_WH SET WAREHOUSE_SIZE = 'XSMALL'").collect()
+    
+    
+    # df_ItemPred.write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_ordering_sim_Temp20241215')
+    # # # return df_ItemPred
+
+    # # #Call Following Step
+    # # # session.sql("CALL INVENTORYSANDBOX.DBO.AOG2_Test()").collect()
+    
+    # # #To View Speed
+    return(session.create_dataframe([1]))
+
+    # null_counts = df_ItemPred.select([(count(col(column).isNull()).alias(f"{column}_null_count")) for column in df_ItemPred.columns])
+    # return null_counts
+
+
+    # Return the final DataFrame
+    # return df_ItemPred#.filter((col("OTF") == 63))# & (col("LT_TYPE") == 'BASE') & (col("ORDERTYPE") == 'domestic'))
