@@ -1,5 +1,9 @@
+# UPDATE FROM TESTING -> CHANGE ALL .TEST ING to .DBO
+# DIFFERENCES FROM CURRENT:
+#     _Curr ent to _Simulation
+
 #Python Code Created by: Erik R
-#Code Last Updated: 1/1/2025
+#Code Last Updated: 3/26/2025 @10:30am
 #Procedure Name: Step_2_RFPGen_Simulation
 #Code Guide Avail Here:
 #Procedure Operation:
@@ -8,6 +12,7 @@
 
 #Updates:
 #10/10/2024 - Updated RFP Ordering sim input logic to pull in most recent ten orders generated.
+#03/26/2025 - Updated the case pack rounding logic to network redistribution logic, removed from step 1B
 
 import snowflake.snowpark as snowpark
 import numpy as np
@@ -27,18 +32,45 @@ def main(session: snowpark.Session):
 
 #Gather Order Information from Python Order Generation
     OrderData = """
+        With Constraint_Setup as (
+        Select
+            ITEMID,
+            SUPPLIERID,
+            CASE WHEN ORDER_TYPE = 'Domestic' THEN 'domestic' ELSE 'import' END as ORDERTYPE,
+            CASE WHEN C1 IS NOT NULL THEN 1 WHEN C2 IS NOT NULL THEN 1
+                WHEN C3 IS NOT NULL THEN 1 WHEN C4 IS NOT NULL THEN 1
+                WHEN C5 IS NOT NULL THEN 1 WHEN C6 IS NOT NULL THEN 1
+                WHEN C7 IS NOT NULL THEN 1 WHEN C8 IS NOT NULL THEN 1
+                WHEN C9 IS NOT NULL THEN 1 WHEN C10 IS NOT NULL THEN 1
+                WHEN C11 IS NOT NULL THEN 1 WHEN C12 IS NOT NULL THEN 1
+                WHEN C13 IS NOT NULL THEN 1 WHEN C14 IS NOT NULL THEN 1
+                WHEN C15 IS NOT NULL THEN 1 WHEN C16 IS NOT NULL THEN 1 ELSE NULL END as ANY_CONSTRAINT
+            -- IFNULL(C1,IFNULL(C2,IFNULL(C3,IFNULL(C4,IFNULL(C5,IFNULL(C6,IFNULL(C7,IFNULL(C8,IFNULL(C9,IFNULL(C10,IFNULL(C11,IFNULL(C12,IFNULL(C13,IFNULL(C14,IFNULL(C15,C16))))))))))))))) as ANY_CONSTRAINT
+        from INVENTORYSANDBOX.DBO.IB_CONSTRAINTS
+        )
+
+        , NetworkOrder as (
+        Select
+            ITEMID,
+            UPDATED_ORDERTYPE,
+            OTF,
+            LT,
+            SUM(CAP_ORDERQTY_USED) as NetOrder
+        from inventorysandbox.DBO.RFP_Simulation_ordering_sim
+        GROUP BY ITEMID, UPDATED_ORDERTYPE, OTF, LT
+        HAVING SUM(CAP_ORDERQTY_USED) <= 0
+        )
+
         Select 
-            sim.*,
-            IFNULL(ItemConst.CONSTRAINT_COUNT, 0) as ItemConstraintCount,
-            IFNULL(BrandConst.CONSTRAINT_COUNT, 0) as BrandConstraintCount
-        from inventorysandbox.dbo.RFP_ordering_sim sim
-        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) MaxCount
-        LEFT JOIN (Select CONST.*, CASE WHEN ORDER_TYPE = 'Domestic' THEN 'domestic' ELSE 'import' END as ORDER_TYPE_USED, CASE WHEN C1 IS NULL THEN 0 ELSE 1 END + CASE WHEN C2 IS NULL THEN 0 ELSE 1 END + CASE WHEN C3 IS NULL THEN 0 ELSE 1 END +                                    CASE WHEN C4 IS NULL THEN 0 ELSE 1 END + CASE WHEN C5 IS NULL THEN 0 ELSE 1 END + CASE WHEN C6 IS NULL THEN 0 ELSE 1 END + CASE WHEN C7 IS NULL THEN 0 ELSE 1 END + CASE WHEN C8 IS NULL THEN 0 ELSE 1 END + CASE                                        WHEN C9 IS NULL THEN 0 ELSE 1 END + CASE WHEN C10 IS NULL THEN 0 ELSE 1 END + CASE WHEN C11 IS NULL THEN 0 ELSE 1 END + CASE WHEN C12 IS NULL THEN 0 ELSE 1 END + CASE WHEN C13 IS NULL THEN 0 ELSE 1 END + CASE WHEN                                    C14 IS NULL THEN 0 ELSE 1 END + CASE WHEN C15 IS NULL THEN 0 ELSE 1 END + CASE WHEN C16 IS NULL THEN 0 ELSE 1 END + CASE WHEN C17 = 1 THEN 0 ELSE 1 END + CASE WHEN C18 = 1 THEN 0 ELSE 1 END + CASE WHEN C19 = 1                                        THEN 0 ELSE 1 END + CASE WHEN C20 = 1 THEN 0 ELSE 1 END + CASE WHEN C21 = 1 THEN 0 ELSE 1 END + CASE WHEN C22 = 1 THEN 0 ELSE 1 END + CASE WHEN C23 = 1 THEN 0 ELSE 1 END as CONSTRAINT_COUNT
-                                from INVENTORYSANDBOX.DBO.IB_CONSTRAINTS CONST) ItemConst on ItemConst.ITEMID = sim.itemid AND ItemConst.ORDER_TYPE_USED = sim.ordertype AND ItemConst.LEVEL = 'Item' AND ItemConst.CONSTRAINT_COUNT > 0
-        LEFT JOIN (Select CONST.*, CASE WHEN ORDER_TYPE = 'Domestic' THEN 'domestic' ELSE 'import' END as ORDER_TYPE_USED, CASE WHEN C1 IS NULL THEN 0 ELSE 1 END + CASE WHEN C2 IS NULL THEN 0 ELSE 1 END + CASE WHEN C3 IS NULL THEN 0 ELSE 1 END +                                    CASE WHEN C4 IS NULL THEN 0 ELSE 1 END + CASE WHEN C5 IS NULL THEN 0 ELSE 1 END + CASE WHEN C6 IS NULL THEN 0 ELSE 1 END + CASE WHEN C7 IS NULL THEN 0 ELSE 1 END + CASE WHEN C8 IS NULL THEN 0 ELSE 1 END + CASE                                        WHEN C9 IS NULL THEN 0 ELSE 1 END + CASE WHEN C10 IS NULL THEN 0 ELSE 1 END + CASE WHEN C11 IS NULL THEN 0 ELSE 1 END + CASE WHEN C12 IS NULL THEN 0 ELSE 1 END + CASE WHEN C13 IS NULL THEN 0 ELSE 1 END + CASE WHEN                                    C14 IS NULL THEN 0 ELSE 1 END + CASE WHEN C15 IS NULL THEN 0 ELSE 1 END + CASE WHEN C16 IS NULL THEN 0 ELSE 1 END + CASE WHEN C17 = 1 THEN 0 ELSE 1 END + CASE WHEN C18 = 1 THEN 0 ELSE 1 END + CASE WHEN C19 = 1                                        THEN 0 ELSE 1 END + CASE WHEN C20 = 1 THEN 0 ELSE 1 END + CASE WHEN C21 = 1 THEN 0 ELSE 1 END + CASE WHEN C22 = 1 THEN 0 ELSE 1 END + CASE WHEN C23 = 1 THEN 0 ELSE 1 END as CONSTRAINT_COUNT
-                                from INVENTORYSANDBOX.DBO.IB_CONSTRAINTS CONST) BrandConst on BrandConst.supplierid = sim.supplierid AND BrandConst.ORDER_TYPE_USED = sim.ordertype AND BrandConst.LEVEL = 'Brand' AND BrandConst.CONSTRAINT_COUNT > 0
+            sim.* 
+        from inventorysandbox.DBO.RFP_Simulation_ordering_sim sim
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.DBO.RFP_Simulation_ordering_sim) MaxCount
+        LEFT JOIN Constraint_Setup CON_ITEM ON CON_ITEM.ITEMID = sim.ITEMID AND CON_ITEM.ORDERTYPE = sim.ordertype
+        LEFT JOIN Constraint_Setup CON_BRAND ON CON_BRAND.SUPPLIERID = sim.SUPPLIERID AND CON_BRAND.ORDERTYPE = sim.ordertype AND CON_BRAND.ITEMID IS NULL
+        LEFT JOIN NetworkOrder on NetworkOrder.ITEMID = sim.ITEMID AND NetworkOrder.UPDATED_ORDERTYPE = sim.updated_ordertype AND NetworkOrder.OTF = sim.OTF AND NetworkOrder.LT = sim.LT
         WHERE MAX_COUNT = RFP_ITERATION_COUNT
-        AND (IFNULL(ItemConst.CONSTRAINT_COUNT, 0) + IFNULL(BrandConst.CONSTRAINT_COUNT, 0)) > 0
+        AND (CON_ITEM.ANY_CONSTRAINT IS NOT NULL OR CON_BRAND.ANY_CONSTRAINT IS NOT NULL)
+        AND NetworkOrder.ITEMID IS NULL
         --AND ITEMID = 408394
         """
         #Create & Filter Output (Item or Brand Options)
@@ -103,12 +135,12 @@ def main(session: snowpark.Session):
     df_OrderData['FIFOAVERAGECOST'].fillna(.01, inplace=True)
     
         #Optional - Return Output
-    #df_OrderData = session.create_dataframe(df_OrderData)
-    #return df_OrderData#.filter(col("ITEMID") == '243726');
+    # df_OrderData = session.create_dataframe(df_OrderData)
+    # return df_OrderData.filter(col("ITEMID") == '14799');
 
 #Destination Limitation Logic
     #General Setup
-    df_DestLimit = df_OrderData[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'FIFOAVERAGECOST', 'CAP_ORDERQTY_USED', 'C17', 'C18', 'C19', 'C20', 'C21', 'C22', 'C23']]
+    df_DestLimit = df_OrderData[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'FIFOAVERAGECOST', 'CAP_ORDERQTY_USED', 'C17', 'C18', 'C19', 'C20', 'C21', 'C22', 'C23']]
     df_DestLimit['FC_Limited'] = np.where((df_DestLimit['C17'] == 0) & (df_DestLimit['FC'] == 'WA'), 1, np.where((df_DestLimit['C18'] == 0) & (df_DestLimit['FC'] == 'NV'), 1, np.where((df_DestLimit['C19'] == 0) & (df_DestLimit['FC'] == 'NE'), 1, 
                                  np.where((df_DestLimit['C20'] == 0) & (df_DestLimit['FC'] == 'TX'), 1, np.where((df_DestLimit['C21'] == 0) & (df_DestLimit['FC'] == 'IN'), 1, np.where((df_DestLimit['C22'] == 0) & (df_DestLimit['FC'] == 'PA'), 1, 
                                  np.where((df_DestLimit['C23'] == 0) & (df_DestLimit['FC'] == 'GA'), 1, 0)))))))
@@ -148,28 +180,28 @@ def main(session: snowpark.Session):
     df_DestLimit['SAV'] = np.round((df_DestLimit['SAV'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['CAP_ORDERQTY_USED'], 0)
     df_DestLimit['ONT'] = np.round((df_DestLimit['ONT'] / df_DestLimit['TOTAL_REDIST_AVAIL']) * df_DestLimit['CAP_ORDERQTY_USED'], 0)
 
-    #df_DestLimit = session.create_dataframe(df_DestLimit)
-    #return df_DestLimit#.filter(col("SUPPLIERID") == 183);
+    # df_DestLimit = session.create_dataframe(df_DestLimit)
+    # return df_DestLimit#.filter(col("SUPPLIERID") == 183);
     
         #Filter Output
-    df_DestLimit = df_DestLimit[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'FIFOAVERAGECOST', 'CAP_ORDERQTY_USED', 'FC_Limited', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
+    df_DestLimit = df_DestLimit[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'FIFOAVERAGECOST', 'CAP_ORDERQTY_USED', 'FC_Limited', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
         #Optional - Return Output
     # df_DestLimit = session.create_dataframe(df_DestLimit)
     # return df_DestLimit#.filter(col("ITEMID") == '243726');
 
         #Sum Order Qty for redistributed FCs
     df_DestLimit_SubsetA = df_DestLimit[df_DestLimit["FC_Limited"] == 1]
-    df_DestLimit_SubsetA = df_DestLimit_SubsetA[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
-    df_DestLimit_SubsetA = df_DestLimit_SubsetA.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum() 
+    df_DestLimit_SubsetA = df_DestLimit_SubsetA[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
+    df_DestLimit_SubsetA = df_DestLimit_SubsetA.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum() 
         #Final Filter
-    df_DestLimit_SubsetA = df_DestLimit_SubsetA[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
+    df_DestLimit_SubsetA = df_DestLimit_SubsetA[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT']]
         #Optional - Return Output
     #df_DestLimit_SubsetA = session.create_dataframe(df_DestLimit_SubsetA)
     #return df_DestLimit_SubsetA
 
     #Join Redistrbuted Order Qty to Baseline Dataset
     df_DestLimit = df_DestLimit.drop(columns=[ 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT'])
-    df_DestLimit = pd.merge(df_DestLimit, df_DestLimit_SubsetA, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_DestLimit = pd.merge(df_DestLimit, df_DestLimit_SubsetA, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
         #Add Redistributed Order Qty to Cap Order Qty
     df_DestLimit['Redistribution_Qty'] = np.where(df_DestLimit['FC_Limited'] == 1, -df_DestLimit['CAP_ORDERQTY_USED'], 
                                                     np.where(df_DestLimit['FC_CODE'] == 'SEA', df_DestLimit['SEA'], np.where(df_DestLimit['FC_CODE'] == 'LAS', df_DestLimit['LAS'], np.where(df_DestLimit['FC_CODE'] == 'LNK', df_DestLimit['LNK'],
@@ -184,16 +216,19 @@ def main(session: snowpark.Session):
     df_DestLimit['Output_RedistributedCost'].fillna(0, inplace=True)
     df_DestLimit['Output_OriginalCost'] = df_DestLimit['Output_Original'] * df_DestLimit['FIFOAVERAGECOST']
         #Final Filter
-    df_DestLimit = df_DestLimit[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'Output_Original', 'Output_OriginalCost', 'FC_Limited', 'Redistribution_Qty', 'Output_Redistributed', 'Output_RedistributedCost']]
+    df_DestLimit = df_DestLimit[['ITEMID', 'SUPPLIERID', 'FC', 'FC_CODE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT', 'Output_Original', 'Output_OriginalCost', 'FC_Limited', 'Redistribution_Qty', 'Output_Redistributed', 'Output_RedistributedCost']]
         #Optional - Return Output
     # df_DestLimit = session.create_dataframe(df_DestLimit)
     # return df_DestLimit#.filter(col("SUPPLIERID") == 183);
 
         #Generate Output Table
     #df_DestLimit['Last Modified']= datetime.now()
-    #session.create_dataframe(df_DestLimit).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.ER_ordering_sim_redist')
+    #session.create_dataframe(df_DestLimit).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.ER_ordering_sim_redist')
 
     #return(session.create_dataframe([1]))
+
+    # df_DestLimit = session.create_dataframe(df_DestLimit)
+    # return df_DestLimit.filter(col("ITEMID") == '14799');
 
 ################
 #END OF REDISTRIBUTION
@@ -246,9 +281,9 @@ def main(session: snowpark.Session):
     df_InputData['FIFOAVERAGECOST'] = np.maximum(df_InputData['FIFOAVERAGECOST'], .01)
     df_InputData['FIFOAVERAGECOST'].fillna(.01, inplace=True)
     
-        #Optional - Return Output
-    #df_InputData = session.create_dataframe(df_InputData)
-    #return df_InputData#.filter(col("ITEMID") == '243726');
+        #Optional - Return Output #Does not duplicate through here
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == '14799');
 
 #Determine Constraint Used & Add Output Cost for MOV's
     df_InputData['Item_Constraint_Used'] = np.where(df_InputData['C3'] > 0, df_InputData['C3'], np.where(df_InputData['C4'] > 0, df_InputData['C4'], np.where(df_InputData['C5'] > 0, df_InputData['C5'], np.where(df_InputData['C6'] > 0, df_InputData['C6'], 0))))
@@ -256,21 +291,25 @@ def main(session: snowpark.Session):
     df_InputData['Item_Constraint_Level'] = np.where(df_InputData['C3'] > 0, 'Ship', np.where(df_InputData['C4'] > 0, 'Ship', np.where(df_InputData['C5'] > 0, 'Mast', np.where(df_InputData['C6'] > 0, 'Mast', ''))))
     
 #Calculate Item Network Cost or Qty; FC Cost / Qty is just the individual item's output
-    Net_MOV = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_RedistributedCost']]
-    Net_MOV = Net_MOV.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOV = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_RedistributedCost']]
+    Net_MOV = Net_MOV.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
     Net_MOV['MOV_TotalStep1'] = Net_MOV['Output_RedistributedCost']
-    Net_MOV = Net_MOV[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOV_TotalStep1']]
+    Net_MOV = Net_MOV[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOV_TotalStep1']]
 
-    Net_MOQ = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_Redistributed']]
-    Net_MOQ = Net_MOQ.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOQ = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Output_Redistributed']]
+    Net_MOQ = Net_MOQ.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
     Net_MOQ['MOQ_TotalStep1'] = Net_MOQ['Output_Redistributed']
-    Net_MOQ = Net_MOQ[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOQ_TotalStep1']]
+    Net_MOQ = Net_MOQ[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOQ_TotalStep1']]
 
         #Join to Input Data dataframe
     Net_MOV['ITEMID'] = Net_MOV['ITEMID'].astype(str)
     Net_MOQ['ITEMID'] = Net_MOQ['ITEMID'].astype(str)
-    df_InputData = pd.merge(df_InputData, Net_MOV, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
-    df_InputData = pd.merge(df_InputData, Net_MOQ, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Net_MOV, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Net_MOQ, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+
+        #Optional - Return Output #Does not duplicate through here
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == '14799');
 
 #Baseline Round & Redistribution Logic
     df_InputData['Constraint_Item_Applicable'] = np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Ship', df_InputData['Output_RedistributedCost'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Ship', df_InputData['Output_Redistributed'],
@@ -284,31 +323,44 @@ def main(session: snowpark.Session):
     
         #Total Redistribution Units / Cost
     Total_RedistV1 = df_InputData[df_InputData["Calc_Round_DecisionV1"] == 'Redistribute']
-    Total_RedistV1 = Total_RedistV1.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False)['Output_Redistributed'].sum()
+    Total_RedistV1 = Total_RedistV1.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False)['Output_Redistributed'].sum()
     Total_RedistV1 = Total_RedistV1.rename(columns={'Output_Redistributed': 'Redist_Avail'}) #Old Name, New Name
     Total_RedistV1['ITEMID'] = Total_RedistV1['ITEMID'].astype(str)
-    df_InputData = pd.merge(df_InputData, Total_RedistV1, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Total_RedistV1, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
         #Redist # of MOQ/MOVs
     df_InputData['Redist_OrderCountAvail'] = np.where(df_InputData['Redist_Avail'] == 0, 0, np.where(df_InputData['Item_Constraint_Used'] == 0, 0, 
                                                         np.round(df_InputData['Redist_Avail'] / df_InputData['Item_Constraint_Used'], 0)))
         #Number of Non-Redist FCs
     Total_RedistV2 = df_InputData[(df_InputData["Calc_Round_DecisionV1"] != 'Redistribute') & (df_InputData["Calc_Round_DecisionV1"] != '')]
     Total_RedistV2['One'] = 1
-    Total_RedistV2 = Total_RedistV2.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False)['One'].sum()
+    Total_RedistV2 = Total_RedistV2.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False)['One'].sum()
     Total_RedistV2 = Total_RedistV2.rename(columns={'One': 'Redist_FCCountAvail'}) #Old Name, New Name
     Total_RedistV2['ITEMID'] = Total_RedistV2['ITEMID'].astype(str)
-    df_InputData = pd.merge(df_InputData, Total_RedistV2, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Total_RedistV2, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == '14799');
+
+    
         #FC Order Rank
     df_InputData['Output_Redistributed_rand'] = np.where(df_InputData['Output_Redistributed'] == 0, 0, df_InputData['Output_Redistributed'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
     FC_Rank = df_InputData[(df_InputData['Output_Redistributed'] > 0) & (df_InputData["Calc_Round_DecisionV1"] != 'Round')]
-    FC_Rank['FC_OrderRankV1'] = FC_Rank.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_Redistributed_rand'].rank(method='dense', ascending=False)
-    FC_Rank = FC_Rank[['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC_OrderRankV1']]
+    FC_Rank['FC_OrderRankV1'] = FC_Rank.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_Redistributed_rand'].rank(method='dense', ascending=False)
+    FC_Rank = FC_Rank[['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC_OrderRankV1']]
     FC_Rank['ITEMID'] = FC_Rank['ITEMID'].astype(str)
-    df_InputData = pd.merge(df_InputData, FC_Rank, how='left', on=['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, FC_Rank, how='left', on=['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+
+        #Optional - Return Output #Duplication Occurs
+    # FC_Rank = session.create_dataframe(FC_Rank)
+    # return FC_Rank.filter(col("ITEMID") == '14799');
+    
         #FC Round Decision Final
     df_InputData['Calc_Round_DecisionV2'] = np.where(df_InputData['Output_Redistributed'] == 0, '', 
                                                      np.where(df_InputData['Calc_Round_DecisionV1'] == 'Round', 'Round', 
                                                               np.where(df_InputData['FC_OrderRankV1'] <= df_InputData['Redist_OrderCountAvail'], 'Round', 'Redistribute')))                                                                                       
+        #Optional - Return Output #Duplication Occurs
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == '14799');
     
 #Redistribution Logic
         #Redistribution Table Query
@@ -325,10 +377,10 @@ def main(session: snowpark.Session):
         #Pull Rounding Decision for other FCs to remove from Redistribution %'s
     fc_values = ['WA', 'NV', 'NE', 'TX', 'IN', 'PA', 'GA']
     def get_other_decision(row, fc):
-        key_tuple = (row['ITEMID'], fc, row['SUPPLIERID'], row['ORDERTYPE'], row['OTF'], row['LT'], row['CAP_DOS'])
+        key_tuple = (row['ITEMID'], fc, row['SUPPLIERID'], row['UPDATED_ORDERTYPE'], row['OTF'], row['LT'], row['CAP_DOS'])
         return decision_map.get(key_tuple)
     
-    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Calc_Round_DecisionV2'].to_dict()
+    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Calc_Round_DecisionV2'].to_dict()
     for fc in fc_values:
         df_InputData[f'{fc}_RoundDecision'] = df_InputData.apply(get_other_decision, axis=1, fc=fc)
         
@@ -354,13 +406,13 @@ def main(session: snowpark.Session):
     df_InputData['ONT'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Round', 0, np.round((df_InputData['ONT'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['Output_Redistributed'], 0))
 
         #Aggregate for final add to order qty
-    df_InputData['SEA'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SEA'].transform('sum')
-    df_InputData['LAS'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LAS'].transform('sum')
-    df_InputData['LNK'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LNK'].transform('sum')
-    df_InputData['DFW'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['DFW'].transform('sum')
-    df_InputData['IND'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['IND'].transform('sum')
-    df_InputData['AVP'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['AVP'].transform('sum')
-    df_InputData['SAV'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SAV'].transform('sum')
+    df_InputData['SEA'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SEA'].transform('sum')
+    df_InputData['LAS'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LAS'].transform('sum')
+    df_InputData['LNK'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LNK'].transform('sum')
+    df_InputData['DFW'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['DFW'].transform('sum')
+    df_InputData['IND'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['IND'].transform('sum')
+    df_InputData['AVP'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['AVP'].transform('sum')
+    df_InputData['SAV'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SAV'].transform('sum')
     
         #Final Redistribution Qty
     df_InputData['Redistribution_Qty_ItemMOQ'] = np.where(df_InputData['Calc_Round_DecisionV2'] == 'Redistribute', -df_InputData['Output_Redistributed'],
@@ -374,20 +426,20 @@ def main(session: snowpark.Session):
 #Calculate Item Network Cost or Qty; FC Cost / Qty is just the individual item's output; Regenerate key outputs based on new order values after redistribution
     df_InputData['Redistributed_OrderCost_ItemMOQ'] = np.round(df_InputData['Redistributed_OrderQty_ItemMOQ'] * df_InputData['FIFOAVERAGECOST'], 2)
     
-    Net_MOV = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistributed_OrderCost_ItemMOQ']]
-    Net_MOV = Net_MOV.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOV = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistributed_OrderCost_ItemMOQ']]
+    Net_MOV = Net_MOV.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
     Net_MOV['MOV_TotalStep2'] = Net_MOV['Redistributed_OrderCost_ItemMOQ']
-    Net_MOV = Net_MOV[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOV_TotalStep2']]
+    Net_MOV = Net_MOV[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOV_TotalStep2']]
 
-    Net_MOQ = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistributed_OrderQty_ItemMOQ']]
-    Net_MOQ = Net_MOQ.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    Net_MOQ = df_InputData[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistributed_OrderQty_ItemMOQ']]
+    Net_MOQ = Net_MOQ.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
     Net_MOQ['MOQ_TotalStep2'] = Net_MOQ['Redistributed_OrderQty_ItemMOQ']
-    Net_MOQ = Net_MOQ[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOQ_TotalStep2']]
+    Net_MOQ = Net_MOQ[['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'MOQ_TotalStep2']]
     
     Net_MOV['ITEMID'] = Net_MOV['ITEMID'].astype(str)
     Net_MOQ['ITEMID'] = Net_MOQ['ITEMID'].astype(str)
-    df_InputData = pd.merge(df_InputData, Net_MOV, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
-    df_InputData = pd.merge(df_InputData, Net_MOQ, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Net_MOV, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, Net_MOQ, how='left', on=['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
     
     df_InputData['Constraint_Item_Applicable'] = np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Ship', df_InputData['Redistributed_OrderCost_ItemMOQ'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Ship', df_InputData['Redistributed_OrderQty_ItemMOQ'],
                                                   np.where(df_InputData['Item_Constraint_Type'] == 'MOV, Per Mast', df_InputData['Redistributed_OrderCost_ItemMOQ'], np.where(df_InputData['Item_Constraint_Type'] == 'MOQ, Per Mast', df_InputData['Redistributed_OrderQty_ItemMOQ'], 0))))
@@ -411,11 +463,11 @@ def main(session: snowpark.Session):
 
 #Generate Output Table
     #df_InputData['Last Modified']= datetime.now()
-    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.ER_ordering_sim_ItemMOQ')
+    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.ER_ordering_sim_ItemMOQ')
 
 #Optional View Outputs
     # df_InputData = session.create_dataframe(df_InputData)
-    # return df_InputData#.filter(col("ITEMID") == '320319');
+    # return df_InputData.filter(col("ITEMID") == '14799');
 #to avoid error
     #return(session.create_dataframe([1]))
 
@@ -429,12 +481,32 @@ def main(session: snowpark.Session):
 
 
     df_InputData['Case_RoundType'] = np.where((df_InputData['Item_Constraint_Used'] >= (df_InputData['Constraint_Total_Applicable']*.95)) & (df_InputData['Item_Constraint_Used'] > 0), 'Roundup', 'Round')
-    df_InputData['Output_CaseRoundQty'] = np.where(df_InputData['Case_RoundType'] == 'Roundup', 
+    df_InputData['Network_CasePackCount'] = np.round(df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_OrderQty_ItemMOQ'].transform('sum') / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY']
+    
+    df_InputData['CaseRoundQty_V1'] = np.where(df_InputData['Case_RoundType'] == 'Roundup', 
                                           np.ceil(df_InputData['Output_OrderQty_ItemMOQ'] / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY'], 
                                           np.round(df_InputData['Output_OrderQty_ItemMOQ'] / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY'])
+
+    df_InputData['Network_CasePackCount_V1'] = np.round(df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['CaseRoundQty_V1'].transform('sum') / df_InputData['CASEQUANTITY']) * df_InputData['CASEQUANTITY']
+    
+    df_InputData['Network_CasePackCount_Variance'] = (df_InputData['Network_CasePackCount_V1']  - df_InputData['Network_CasePackCount']) / df_InputData['CASEQUANTITY']
+
+    df_InputData['Output_OrderQty_ItemMOQ_rand'] = np.where(df_InputData['Output_OrderQty_ItemMOQ'] == 0, 0, df_InputData['Output_OrderQty_ItemMOQ'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    df_InputData['FC_OrderRank'] = np.where(df_InputData['Output_OrderQty_ItemMOQ_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_OrderQty_ItemMOQ_rand'].rank(method='dense', ascending=False))
+
+    df_InputData['CasePackAdjust'] = np.where(df_InputData['FC_OrderRank'] > np.abs(df_InputData['Network_CasePackCount_Variance']), 0,
+                                              np.where(df_InputData['Network_CasePackCount_Variance'] < 0, df_InputData['CASEQUANTITY'], -df_InputData['CASEQUANTITY']))
+    
+    
+    df_InputData['Output_CaseRoundQty'] = df_InputData['CaseRoundQty_V1'] + df_InputData['CasePackAdjust']
     df_InputData['Output_CaseRoundCost'] = df_InputData['Output_CaseRoundQty'] * df_InputData['FIFOAVERAGECOST']
     df_InputData['Output_CaseRoundQty'].fillna(0, inplace=True)
     df_InputData['Output_CaseRoundCost'].fillna(0, inplace=True)
+
+    df_InputData = df_InputData.drop(columns=['Network_CasePackCount', 'CaseRoundQty_V1', 'Network_CasePackCount_V1', 'Output_OrderQty_ItemMOQ_rand', 'FC_OrderRank'])
+
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter(col("ITEMID") == 203758);
 
 ################
 #END OF ITEM CASE PACK
@@ -474,10 +546,10 @@ def main(session: snowpark.Session):
     df_InputData = pd.merge(df_InputData, df_ItemConstraints, how='left', on=['ITEMID', 'ORDERTYPE', 'SUPPLIERID'])
 
 #Item MOQ / MOV from Previous Output
-    df_InputData['ItemMOQ/V_TotalStep1'] =  np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Ship', df_InputData.groupby(['ITEMID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundCost'].transform('sum'), 
-            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Ship', df_InputData.groupby(['ITEMID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum'), 
-            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Mast', df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundCost'].transform('sum'), 
-            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Mast', df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum'), 99999.99))))
+    df_InputData['ItemMOQ/V_TotalStep1'] =  np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Ship', df_InputData.groupby(['ITEMID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundCost'].transform('sum'), 
+            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Ship', df_InputData.groupby(['ITEMID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum'), 
+            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Mast', df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundCost'].transform('sum'), 
+            np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Mast', df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum'), 99999.99))))
 
 #Generate Key Values and Round Decision
         #Pallet Constraint Value
@@ -505,8 +577,8 @@ def main(session: snowpark.Session):
                                                            df_InputData.apply(lambda row: roundup(row['Output_CaseRoundQty'], row['Pall_Constraint']), axis=1)))
 
 #Calculate number of pallets and if there is excess that needs to be removed
-    df_InputData['PallQty_TotalOriginal'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum')
-    df_InputData['PallQty_TotalV1'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_PalletQtyV1'].transform('sum')
+    df_InputData['PallQty_TotalOriginal'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_CaseRoundQty'].transform('sum')
+    df_InputData['PallQty_TotalV1'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_PalletQtyV1'].transform('sum')
     
     df_InputData['PallQty_TotalOriginal'] = df_InputData.apply(lambda row: mround(row['PallQty_TotalOriginal'], row['Pall_Constraint']), axis=1)
     df_InputData['PallQty_TotalV1'] = df_InputData.apply(lambda row: mround(row['PallQty_TotalV1'], row['Pall_Constraint']), axis=1)
@@ -514,7 +586,7 @@ def main(session: snowpark.Session):
     df_InputData['PallQty_NetAdjustment_Count'] = np.where(df_InputData['Pall_Constraint'] == 0, 0, df_InputData['PallQty_NetAdjustment'] / df_InputData['Pall_Constraint'])
         #FC Rank for add / remove
     df_InputData['Output_PalletQtyV1_rand'] = np.where(df_InputData['Output_PalletQtyV1'] == 0, 0, df_InputData['Output_PalletQtyV1'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
-    df_InputData['FC_OrderRank'] = np.where(df_InputData['Output_PalletQtyV1_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_PalletQtyV1_rand'].rank(method='dense', ascending=False))
+    df_InputData['FC_OrderRank'] = np.where(df_InputData['Output_PalletQtyV1_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_PalletQtyV1_rand'].rank(method='dense', ascending=False))
     #df_InputData['PallQty_NetAdjustment_Count'] = -2 #Used for testing outputs given excess round required
     df_InputData['ExcessNetPallet_Adjust'] = np.where(df_InputData['FC_OrderRank'] > np.absolute(df_InputData['PallQty_NetAdjustment_Count']), 0,
                                                       np.where(df_InputData['PallQty_NetAdjustment_Count'] < 0, -df_InputData['Pall_Constraint'], df_InputData['Pall_Constraint']))
@@ -532,7 +604,7 @@ def main(session: snowpark.Session):
                             
 #Generate Output Table
     #df_InputData['Last Modified']= datetime.now()
-    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.ER_ordering_sim_ItemPallet') 
+    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.ER_ordering_sim_ItemPallet') 
     
 #Optional View Output
     #df_InputData = session.create_dataframe(df_InputData)
@@ -581,16 +653,16 @@ def main(session: snowpark.Session):
     #df_InputData['Brand_MOV_Used'] = 50000 #Used for testing different MOV values
 
 #Calculate Baseline MOV & Round Required
-    df_InputData['BrandMOV_TotalStep1'] = np.where(df_InputData['Brand_MOV_Type'] == 'Ship', df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_ItemPalletCost'].transform('sum'),
-                                                    np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_ItemPalletCost'].transform('sum'), 99999.99))
+    df_InputData['BrandMOV_TotalStep1'] = np.where(df_InputData['Brand_MOV_Type'] == 'Ship', df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_ItemPalletCost'].transform('sum'),
+                                                    np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_ItemPalletCost'].transform('sum'), 99999.99))
     df_InputData['MOV_RequiredRoundUp'] = np.where(df_InputData['BrandMOV_TotalStep1'] == 0, 0, np.maximum(0, df_InputData['Brand_MOV_Used'] - df_InputData['BrandMOV_TotalStep1']))
         #Helper Columns
-    df_InputData['MOV_NetRoundup'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RequiredRoundUp'].transform('sum')
-    df_InputData['MOV_NetTotal'] = np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData['BrandMOV_TotalStep1'], df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1'].transform('sum'))
-    df_InputData['MOV_NetMaxRoundup'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RequiredRoundUp'].transform('max')
+    df_InputData['MOV_NetRoundup'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RequiredRoundUp'].transform('sum')
+    df_InputData['MOV_NetTotal'] = np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData['BrandMOV_TotalStep1'], df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1'].transform('sum'))
+    df_InputData['MOV_NetMaxRoundup'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RequiredRoundUp'].transform('max')
     df_InputData['MOV_NetOrderCount'] = np.where(df_InputData['MOV_NetTotal'] == 0, 9999, np.round(df_InputData['MOV_NetTotal'] / df_InputData['Brand_MOV_Used'], 0))
     df_InputData['BrandMOV_TotalStep1_rand'] = np.where(df_InputData['BrandMOV_TotalStep1'] == 0, 0, df_InputData['BrandMOV_TotalStep1'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
-    df_InputData['MOV_FC_OrderRank'] = np.where(df_InputData['BrandMOV_TotalStep1_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1_rand'].rank(method='dense', ascending=False))
+    df_InputData['MOV_FC_OrderRank'] = np.where(df_InputData['BrandMOV_TotalStep1_rand'] == 0, 99, df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1_rand'].rank(method='dense', ascending=False))
         #Round Up Decision V1
     df_InputData['Baseline_Round_Decision_V1'] = np.where((df_InputData['MOV_NetRoundup'] == 0) | (df_InputData['MOV_RequiredRoundUp'] == 0), 'Normal',
                                                        np.where(df_InputData['BrandMOV_TotalStep1'] < (df_InputData['MOV_NetMaxRoundup'] * .25), 'Redistribute',
@@ -598,10 +670,10 @@ def main(session: snowpark.Session):
                                                                          np.where(df_InputData['MOV_FC_OrderRank'] > df_InputData['MOV_NetOrderCount'], 'Redistribute', 'Normal'))))
         #Normal Count Helper Column Used in Decision V2 
     NormalCount = df_InputData[df_InputData['Baseline_Round_Decision_V1'] == 'Normal']
-    NormalCount = NormalCount[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC']]
-    NormalCount = NormalCount.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).count()
+    NormalCount = NormalCount[['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC']]
+    NormalCount = NormalCount.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).count()
     NormalCount = NormalCount.rename(columns={'FC': 'Normal_Count'})
-    df_InputData = pd.merge(df_InputData, NormalCount, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    df_InputData = pd.merge(df_InputData, NormalCount, how='left', on=['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
     del NormalCount
         #Round Up Decision V2
     df_InputData['Normal_Count'].fillna(0, inplace=True)
@@ -625,14 +697,14 @@ def main(session: snowpark.Session):
         #Pull Rounding Decision for other FCs to remove from Redistribution %'s
     fc_values = ['WA', 'NV', 'NE', 'TX', 'IN', 'PA', 'GA']
     def get_other_decision(row, fc):
-        key_tuple = (row['ITEMID'], fc, row['SUPPLIERID'], row['ORDERTYPE'], row['OTF'], row['LT'], row['CAP_DOS'])
+        key_tuple = (row['ITEMID'], fc, row['SUPPLIERID'], row['UPDATED_ORDERTYPE'], row['OTF'], row['LT'], row['CAP_DOS'])
         return decision_map.get(key_tuple)
         #Round Decision
-    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_Round_Decision'].to_dict()
+    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_Round_Decision'].to_dict()
     for fc in fc_values:
         df_InputData[f'{fc}_RoundDecision'] = df_InputData.apply(get_other_decision, axis=1, fc=fc)
         #Total Order Qty
-    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1'].to_dict()
+    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['BrandMOV_TotalStep1'].to_dict()
     for fc in fc_values:
         df_InputData[f'{fc}_MOVTotal'] = df_InputData.apply(get_other_decision, axis=1, fc=fc)
         
@@ -661,13 +733,13 @@ def main(session: snowpark.Session):
     df_InputData = df_InputData.drop(columns=['SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT', 'WA_RoundDecision', 'NV_RoundDecision', 'NE_RoundDecision', 'TX_RoundDecision', 'IN_RoundDecision', 'PA_RoundDecision', 'GA_RoundDecision', 'WA_MOVTotal', 'NV_MOVTotal', 'NE_MOVTotal', 'TX_MOVTotal', 'IN_MOVTotal', 'PA_MOVTotal', 'GA_MOVTotal', 'Max_FC_Percent'])
         #Aggregate for final add to order qty
     RedistQty = df_InputData[df_InputData['MOV_Round_Decision'] == 'Redistribute']
-    RedistQty = RedistQty[['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistribution_FC', 'BrandMOV_TotalStep1', 'Output_ItemPalletQty']]
-    RedistQty = RedistQty.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistribution_FC'], as_index=False).sum()
+    RedistQty = RedistQty[['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistribution_FC', 'BrandMOV_TotalStep1', 'Output_ItemPalletQty']]
+    RedistQty = RedistQty.groupby(['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Redistribution_FC'], as_index=False).sum()
     RedistQty = RedistQty.rename(columns={'BrandMOV_TotalStep1': 'MOVRedist_Final'})
     RedistQty = RedistQty.rename(columns={'Redistribution_FC': 'FC_CODE'})
     RedistQty = RedistQty.rename(columns={'Output_ItemPalletQty': 'OrderQty_RedistFinal'})
     RedistQty['ITEMID'] = RedistQty['ITEMID'].astype(str)
-    df_InputData = pd.merge(df_InputData, RedistQty, how='left', on=['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC_CODE'])
+    df_InputData = pd.merge(df_InputData, RedistQty, how='left', on=['ITEMID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'FC_CODE'])
     del RedistQty
         #Total MOV V2
     df_InputData['MOVRedist_Final'].fillna(0, inplace=True)
@@ -685,10 +757,10 @@ def main(session: snowpark.Session):
     df_InputData['MOV_RoundUnits'] = np.round(((df_InputData['MOV_OrderPercent'] * df_InputData['MOV_RequiredRoundUpV2']) / df_InputData['FIFOAVERAGECOST']) / 
                                               np.where(df_InputData['Item_Pallet_Type'] == 'Req', df_InputData['Item_Pallet_Constraint'], 1), 0) * np.where(df_InputData['Item_Pallet_Type'] == 'Req', df_InputData['Item_Pallet_Constraint'], 1)
     df_InputData['MOV_RoundCost'] = df_InputData['MOV_RoundUnits'] * df_InputData['FIFOAVERAGECOST']
-    df_InputData['MOV_ReqRoundMissing'] = df_InputData['MOV_RequiredRoundUpV2'] - np.where(df_InputData['Brand_MOV_Type'] == 'Ship', df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RoundCost'].transform('sum'),
-                                                    np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RoundCost'].transform('sum'), 0))
-    df_InputData['MOV_OrderPercentAvail_Ship'] = df_InputData[df_InputData['MOV_RoundCost'] > 0].groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_OrderPercent'].transform('sum')
-    df_InputData['MOV_OrderPercentAvail_Mast'] = df_InputData[df_InputData['MOV_RoundCost'] > 0].groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_OrderPercent'].transform('sum')
+    df_InputData['MOV_ReqRoundMissing'] = df_InputData['MOV_RequiredRoundUpV2'] - np.where(df_InputData['Brand_MOV_Type'] == 'Ship', df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RoundCost'].transform('sum'),
+                                                    np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_RoundCost'].transform('sum'), 0))
+    df_InputData['MOV_OrderPercentAvail_Ship'] = df_InputData[df_InputData['MOV_RoundCost'] > 0].groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_OrderPercent'].transform('sum')
+    df_InputData['MOV_OrderPercentAvail_Mast'] = df_InputData[df_InputData['MOV_RoundCost'] > 0].groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['MOV_OrderPercent'].transform('sum')
     df_InputData['MOV_OrderPercentFinal'] = (df_InputData['MOV_OrderPercent'] / np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData['MOV_OrderPercentAvail_Mast'], df_InputData['MOV_OrderPercentAvail_Ship']))
     
     df_InputData['MOV_ReqRoundAdd'] = np.where(df_InputData['MOV_RoundCost'] == 0, 0, df_InputData['MOV_OrderPercentFinal'] * df_InputData['MOV_ReqRoundMissing']) * 1.05
@@ -712,20 +784,20 @@ def main(session: snowpark.Session):
     iteration_count = df_InputData['RFP_ITERATION_COUNT'].iloc[0]
 
     if iteration_count == 1:
-        session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_IB_optimization')
+        session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_IB_optimization')
     else:
-        session.create_dataframe(df_InputData).write.mode("append").saveAsTable('inventorysandbox.dbo.RFP_IB_optimization')
+        session.create_dataframe(df_InputData).write.mode("append").saveAsTable('inventorysandbox.DBO.RFP_Simulation_IB_optimization')
 
 #Optional - View Output   
-    #df_InputData = session.create_dataframe(df_InputData)
-    #return df_InputData#.filter((col("OTF") == 77) & (col("ORDERTYPE") == 'domestic'));
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter((col("OTF") == 77) & (col("ORDERTYPE") == 'domestic'));
 
 ################
 #END OF BRAND MOV
 ################
 
     #Call Following Step
-    #session.sql("CALL INVENTORYSANDBOX.DBO.AOG4_Test()").collect()
+    #session.sql("CALL inventorysandbox.DBO.AOG4_Test()").collect()
 
 
     return(session.create_dataframe([1]))
