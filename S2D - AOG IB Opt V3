@@ -1,0 +1,631 @@
+# UPDATE FROM TESTING -> CHANGE ALL .TEST ING to .DBO
+# DIFFERENCES FROM CURRENT:
+#     _Curr ent to _Simulation
+
+#Python Code Created by: Erik R
+#Procedure Name: Step_2D_RFPGen_Simulation
+#Code Last Updated: 3/26/2025 @11:15am
+#Code Guide Avail Here: 
+
+#Update Notes: 170672
+#03/26/2025 - Updated for add back requirements plus case pack
+
+
+import snowflake.snowpark as snowpark
+import numpy as np
+import pandas as pd
+import random
+from snowflake.snowpark.functions import col
+from datetime import *
+
+def main(session: snowpark.Session): 
+#Adjust Warehouse Size
+    # update_command = "ALTER WAREHOUSE IBOPTIMIZATION_WH SET WAREHOUSE_SIZE = 'XLARGE'"
+    # session.sql(update_command).collect()
+
+#Gather Order Information from Step 7 of IB Opt.
+    InputData = """
+        With FIFO_COST as (
+        Select * from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE Fifo
+        INNER JOIN (Select max(DM_UPDATEDON) as MaxDate from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE) as MaxDate on MaxDate.MaxDate = Fifo.DM_UPDATEDON
+        --Where ITEMID = 243726
+        )
+        
+        ,Constraint_Setup as (
+        Select
+            ITEMID,
+            SUPPLIERID,
+            CASE WHEN ORDER_TYPE = 'Domestic' THEN 'domestic' ELSE 'import' END as ORDERTYPE,
+            CASE WHEN C1 IS NOT NULL THEN 1 WHEN C2 IS NOT NULL THEN 1
+                WHEN C3 IS NOT NULL THEN 1 WHEN C4 IS NOT NULL THEN 1
+                WHEN C5 IS NOT NULL THEN 1 WHEN C6 IS NOT NULL THEN 1
+                WHEN C7 IS NOT NULL THEN 1 WHEN C8 IS NOT NULL THEN 1
+                WHEN C9 IS NOT NULL THEN 1 WHEN C10 IS NOT NULL THEN 1
+                WHEN C11 IS NOT NULL THEN 1 WHEN C12 IS NOT NULL THEN 1
+                WHEN C13 IS NOT NULL THEN 1 WHEN C14 IS NOT NULL THEN 1
+                WHEN C15 IS NOT NULL THEN 1 WHEN C16 IS NOT NULL THEN 1 ELSE NULL END as ANY_CONSTRAINT
+            -- IFNULL(C1,IFNULL(C2,IFNULL(C3,IFNULL(C4,IFNULL(C5,IFNULL(C6,IFNULL(C7,IFNULL(C8,IFNULL(C9,IFNULL(C10,IFNULL(C11,IFNULL(C12,IFNULL(C13,IFNULL(C14,IFNULL(C15,C16))))))))))))))) as ANY_CONSTRAINT
+        from INVENTORYSANDBOX.DBO.IB_CONSTRAINTS
+        )
+        
+        , NetworkOrder as (
+        Select
+            ITEMID,
+            UPDATED_ORDERTYPE,
+            OTF,
+            LT,
+            SUM(UPDATED_ORDERQTY) as NetOrder
+        from inventorysandbox.DBO.RFP_Simulation_OriginDecision
+        GROUP BY ITEMID, UPDATED_ORDERTYPE, OTF, LT
+        HAVING SUM(UPDATED_ORDERQTY) <= 0
+        )
+        
+        , ADDBACK as (
+        Select
+            sim.ITEMID, sim.SUPPLIERID, FC,
+            CASE WHEN FC = 'WA' THEN 'SEA' WHEN FC = 'NV' THEN 'LAS' WHEN FC = 'NE' THEN 'LNK' WHEN FC = 'TX' THEN 'DFW' WHEN FC = 'IN' THEN 'IND' WHEN FC = 'PA' THEN 'AVP' ELSE 'SAV' END as FC_CODE,
+            sim.ORDERTYPE, sim.UPDATED_ORDERTYPE, sim.OTF, sim.LT, CAP_DOS, ITERATION_COUNT, RFP_ITERATION_COUNT,
+            null as ORIGIN_CUBETARGET,
+            UPDATED_ORDERQTY as Output_Original,
+            UPDATED_ORDERQTY * FIFO_COST.FIFOAVERAGECOST as Output_OriginalCost,
+            0 as FC_Limited,
+            0 as Redistribution_Qty,
+            UPDATED_ORDERQTY as Output_Redistributed,
+            UPDATED_ORDERQTY * FIFO_COST.FIFOAVERAGECOST as Output_RedistributedCost,
+            sim.CASEQUANTITY, prod.itemcube as ITEMCUBE,
+            FIFO_COST.FIFOAVERAGECOST,
+            null as ITEM_CONSTRAINT_USED,
+            null as ITEM_MOQMOV_TYPE,
+            UPDATED_ORDERQTY as Redistribution_Qty_ItemMOQ,
+            null as Constraint_Total_Applicable,
+            null as Roundup_ItemMOQ,
+            UPDATED_ORDERQTY as Output_OrderQty_ItemMOQ,
+            IFNULL(UPDATED_ORDERQTY * FIFO_COST.FIFOAVERAGECOST, 0) as Output_OrderCost_ItemMOQ,
+            'round' as Case_RoundType,
+            null as Network_CasePackCount_Variance,
+            null as CasePackAdjust,
+            (round(UPDATED_ORDERQTY / sim.CASEQUANTITY) * sim.CASEQUANTITY) as Output_CaseRoundQty,
+            IFNULL((round(UPDATED_ORDERQTY / sim.CASEQUANTITY) * sim.CASEQUANTITY) * FIFO_COST.FIFOAVERAGECOST, 0) as Output_CaseRoundCost,
+            null as ITEM_PALLET_TYPE,
+            null as ITEM_PALLET_CONSTRAINT,
+            0 as Item_Pallet_TotalRound,
+            (round(UPDATED_ORDERQTY / sim.CASEQUANTITY) * sim.CASEQUANTITY) as Output_ItemPalletQty,
+            IFNULL((round(UPDATED_ORDERQTY / sim.CASEQUANTITY) * sim.CASEQUANTITY) * FIFO_COST.FIFOAVERAGECOST, 0) as Output_ItemPalletCost,
+            null as Brand_MOV_Type,
+            null as Brand_MOV_Used,
+            0 as MOV_RoundUnits,
+            0 as MOV_ReqRoundAdd_Pallet,
+            (round(UPDATED_ORDERQTY / sim.CASEQUANTITY) * sim.CASEQUANTITY) as Output_BrandMOVQty,
+            IFNULL((round(UPDATED_ORDERQTY / sim.CASEQUANTITY) * sim.CASEQUANTITY) * FIFO_COST.FIFOAVERAGECOST, 0) as OUTPUT_BRANDMOVCOST,
+            "Last Modified"
+        from inventorysandbox.DBO.RFP_Simulation_OriginDecision sim
+        LEFT JOIN FIFO_COST on FIFO_COST.ITEMID = sim.ITEMID
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT prod on prod.ITEMID = sim.ITEMID
+        LEFT JOIN Constraint_Setup CON_ITEM ON CON_ITEM.ITEMID = sim.ITEMID AND CON_ITEM.ORDERTYPE = sim.ordertype
+        LEFT JOIN Constraint_Setup CON_BRAND ON CON_BRAND.SUPPLIERID = sim.SUPPLIERID AND CON_BRAND.ORDERTYPE = sim.ordertype AND CON_BRAND.ITEMID IS NULL
+        LEFT JOIN NetworkOrder on NetworkOrder.ITEMID = sim.ITEMID AND NetworkOrder.UPDATED_ORDERTYPE = sim.updated_ordertype AND NetworkOrder.OTF = sim.OTF AND NetworkOrder.LT = sim.LT
+        INNER JOIN (Select MAX(RFP_ITERATION_COUNT) as MAXCOUNT from inventorysandbox.DBO.RFP_Simulation_IB_optimizationV2) MAXCOUNT on MAXCOUNT.MAXCOUNT = sim.RFP_ITERATION_COUNT
+        WHERE (CON_ITEM.ANY_CONSTRAINT IS NULL AND CON_BRAND.ANY_CONSTRAINT IS NULL)
+        AND NetworkOrder.ITEMID IS NULL
+        )
+        
+        , OriginalOutput as (
+        Select V2.* 
+        from inventorysandbox.DBO.RFP_Simulation_IB_optimizationV2 V2
+        INNER JOIN (Select MAX(RFP_ITERATION_COUNT) as MAXCOUNT from inventorysandbox.DBO.RFP_Simulation_IB_optimizationV2) MAXCOUNT on MAXCOUNT.MAXCOUNT = V2.RFP_ITERATION_COUNT
+        )
+
+        , FinalOutput as (
+        Select * from ADDBACK
+        UNION ALL
+        Select * from OriginalOutput
+        )
+
+        Select * from FinalOutput --WHERE ITEMID = 49315
+        """
+        #Create & Filter Output (Item or Brand Options)
+    df_InputData = session.sql(InputData)
+    # df_InputData = session.table(InputData)#.filter((col("SUPPLIERID") == '574'))
+        #Covert to Pandas
+    df_InputData = df_InputData.to_pandas()
+#Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter((col("OTF") == 49) & (col("LT") == 105) & (col("FC") == 'IN')); #col("ITEMID") == 253177))
+
+
+    
+#Setup Constraint Data
+    df_InputData['ORIGIN_CUBETARGET'].fillna(100, inplace=True)
+    df_InputData = df_InputData.rename(columns={'ORIGIN_CUBETARGET': 'Cube_Min'}) #Old Name, New Name
+    df_InputData['Cube_Max'] = df_InputData['Cube_Min'] + 75
+    df_InputData['Weight_Min'] = 1
+    df_InputData['Weight_Max'] = 46000
+    #df_ItemConstraints = df_ItemConstraints.rename(columns={'C24': 'Unit_Target'})
+
+#Temp need to remove once Unit Target is available in the constraint upload
+    df_InputData['Unit_Target'] = 0
+    #df_ItemConstraints['Cube_Min'] = 2300
+    #df_ItemConstraints['Cube_Max'] = 2400
+#Temp need to remove
+    
+    df_InputData['Brand_CubeWeightUnit_Type'] = np.where((df_InputData['Cube_Min'] > 1) | (df_InputData['Cube_Max'] > 1), 'Cube', np.where((df_InputData['Weight_Min'] > 0) | (df_InputData['Weight_Max'] > 0), 'Weight', np.where(df_InputData['Unit_Target'] > 0, 'Unit', 'None')))
+    df_InputData['Brand_CubeWeightUnit_Constraint_Lower'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['Cube_Min'],
+                                                                           np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Weight_Min'],
+                                                                                    np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Unit', df_InputData['Unit_Target'], 0)))
+    df_InputData['Brand_CubeWeightUnit_Constraint_Upper'] = np.where(df_InputData['Cube_Max'] > 1, df_InputData['Cube_Max'],
+                                                                           np.where(df_InputData['Weight_Max'] > 0, df_InputData['Weight_Max'],
+                                                                                    np.where(df_InputData['Unit_Target'] > 0, df_InputData['Unit_Target'] + 5, 999999)))
+#Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter((col("OTF") == 49) & (col("LT") == 105) & (col("FC") == 'IN')); #col("ITEMID") == 253177))
+    
+#Pull Case Weight
+    OrdProd = 'LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT'
+    OrdProd = session.table(OrdProd)
+    OrdProd = OrdProd.to_pandas()
+    OrdProd = OrdProd[['ITEMID', 'CASEWEIGHT', 'CASEQUANTITY']]
+    OrdProd['Item_Weight'] = OrdProd['CASEWEIGHT'] / OrdProd['CASEQUANTITY']
+    OrdProd = OrdProd[['ITEMID', 'Item_Weight']]
+    df_InputData['ITEMID'] = df_InputData['ITEMID'].astype(str)
+    OrdProd['ITEMID'] = OrdProd['ITEMID'].astype(str)
+    df_InputData = pd.merge(df_InputData, OrdProd, how='left', on=['ITEMID'])
+    del OrdProd
+    df_InputData['Output_BrandPalletCube'] = df_InputData['OUTPUT_BRANDMOVQTY'] * df_InputData['ITEMCUBE']
+    df_InputData['Output_BrandPalletWeight'] = df_InputData['OUTPUT_BRANDMOVQTY'] * df_InputData['Item_Weight']
+        #Fill in blanks and final filter
+    df_InputData['Output_BrandPalletCube'].fillna(0, inplace=True)
+    df_InputData['Output_BrandPalletWeight'].fillna(0, inplace=True)
+    df_InputData['Brand_CubeWeightUnit_Type'].fillna('None', inplace=True)
+    df_InputData['Brand_CubeWeightUnit_Constraint_Lower'].fillna(0, inplace=True)
+    df_InputData['Brand_CubeWeightUnit_Constraint_Upper'].fillna(999999, inplace=True)
+    df_InputData = df_InputData.drop(columns=['Cube_Min', 'Cube_Max', 'Weight_Min', 'Weight_Max', 'Unit_Target', 'Last Modified'])
+
+#Generate total used and baseline round
+    df_InputData['Brand_ItemTotal'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['Output_BrandPalletCube'], 
+                                                               np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Output_BrandPalletWeight'], df_InputData['OUTPUT_BRANDMOVQTY']))
+    df_InputData['Brand_ConstraintTotal'] = df_InputData.groupby(['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ItemTotal'].transform('sum')
+    
+    def mround(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.round(x / base)
+            
+    def rounddown(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.floor(x / base)
+
+    def roundup(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.ceil(x / base)
+            
+    df_InputData['Constraint_Target'] = (df_InputData['Brand_CubeWeightUnit_Constraint_Lower'] + df_InputData['Brand_CubeWeightUnit_Constraint_Upper']) / 2
+        #Generate Baseline Required Round Logic
+    df_InputData['Min_Round'] = df_InputData.apply(lambda row: rounddown(row['Brand_ConstraintTotal'], row['Brand_CubeWeightUnit_Constraint_Lower']), axis=1) / df_InputData['Brand_CubeWeightUnit_Constraint_Lower']
+    df_InputData['Max_Round'] = df_InputData.apply(lambda row: rounddown(row['Brand_ConstraintTotal'], row['Brand_CubeWeightUnit_Constraint_Upper']), axis=1) / df_InputData['Brand_CubeWeightUnit_Constraint_Upper']
+    df_InputData['Round_Required?'] = np.where(df_InputData['Brand_ConstraintTotal'] == 0, 'No_Round',
+                                               np.where(df_InputData['Min_Round'] == df_InputData['Max_Round'], 'Round_Req', 'No_Round')) #Determines if output is within acceptable range with no adjustment
+    
+    df_InputData['Baseline_Round'] = np.where((df_InputData['Brand_CubeWeightUnit_Type'] == 'None') | (df_InputData['Round_Required?'] == 'No_Round'), 0,
+                                              df_InputData.apply(lambda row: mround(row['Brand_ConstraintTotal'], row['Constraint_Target']), axis=1) - df_InputData['Brand_ConstraintTotal']) #Assuming basic round, cube adjustment required
+    
+    df_InputData['Baseline_Round_Decision'] = np.where(np.abs(df_InputData['Baseline_Round'] / df_InputData['Brand_ConstraintTotal']) > .5, 'Redistribute',
+                                                       np.where(df_InputData['Round_Required?'] == 'Round_Req', 'Round', 'None'))
+    df_InputData = df_InputData.drop(columns=['Min_Round', 'Max_Round'])
+
+#Optional View Output
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter((col("SUPPLIERID") == 386) & (col("UPDATED_ORDERTYPE") == 'domestic BIRMINGHAM') & (col("RFP_ITERATION_COUNT") == 2)); #col("ITEMID") == 253177))
+
+#Generate initial output and check for excess or shortage of orders
+    df_InputData['Brand_ConstraintTotalV2'] = df_InputData['Brand_ConstraintTotal'] + df_InputData['Baseline_Round']
+    df_InputData['Brand_ConstraintTotal_Network'] = df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTotal'].transform('sum')
+    df_InputData['Brand_ConstraintTotalV2_Network'] = df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTotalV2'].transform('sum')
+
+        #Order Counts
+    df_InputData['OrderCount_Original'] = np.round(df_InputData['Brand_ConstraintTotal_Network'] / df_InputData['Constraint_Target'], 0)
+    df_InputData['OrderCount_New'] = np.round(df_InputData['Brand_ConstraintTotalV2_Network'] / df_InputData['Constraint_Target'], 0)
+
+#West Coast / East Coast Redistribution
+    WestCoast = df_InputData[['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Brand_ConstraintTotal', 'Brand_ConstraintTotalV2']]
+    WestCoast = WestCoast[(WestCoast['FC'] == 'WA') | (WestCoast['FC'] == 'NV') | (WestCoast['FC'] == 'TX')]
+    WestCoast = WestCoast.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'], as_index=False).sum()
+    WestCoast = WestCoast.rename(columns={'Brand_ConstraintTotal': 'WestCoast_Orig'})
+    WestCoast = WestCoast.rename(columns={'Brand_ConstraintTotalV2': 'WestCoast_New'})
+    WestCoast = WestCoast[['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'WestCoast_Orig', 'WestCoast_New']]
+    df_InputData = pd.merge(df_InputData, WestCoast, how='left', on=['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    del WestCoast
+
+        #Generate east coast values
+    df_InputData['EastCoast_Orig'] = df_InputData['Brand_ConstraintTotal_Network'] - df_InputData['WestCoast_Orig']
+    df_InputData['EastCoast_New'] = df_InputData['Brand_ConstraintTotalV2_Network'] - df_InputData['WestCoast_New']
+    
+        #Generate Coast Adjustment, rank required to assign adjust
+    df_InputData['Coast_Adjustment'] = np.where(df_InputData['OrderCount_Original'] <= 1, 'Normal', 
+                                                np.where((df_InputData['EastCoast_Orig'] > 0) & (df_InputData['EastCoast_New'] ==0), 'Adjust_to_EC',
+                                                         np.where((df_InputData['WestCoast_Orig'] > 0) & (df_InputData['WestCoast_New'] ==0), 'Adjust_to_WC', 'Normal')))
+
+        #East Coast Only Rank
+    EastCoast = df_InputData[['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Brand_ConstraintTotal']]
+    EastCoast = EastCoast[(EastCoast['FC'] == 'NE') | (EastCoast['FC'] == 'IN') | (EastCoast['FC'] == 'PA') | (EastCoast['FC'] == 'GA')]
+    EastCoast['Brand_ConstraintTotal_rand'] = np.where(EastCoast['Brand_ConstraintTotal'] == 0, 0, EastCoast['Brand_ConstraintTotal'] + EastCoast.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    EastCoast['FC_OrderRank_EC'] = np.where(EastCoast['Brand_ConstraintTotal_rand'] == 0, 99, EastCoast.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTotal_rand'].rank(method='dense', ascending=False))
+    EastCoast = EastCoast.drop(columns=['Brand_ConstraintTotal', 'Brand_ConstraintTotal_rand'])
+    df_InputData = pd.merge(df_InputData, EastCoast, how='left', on=['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    del EastCoast
+        #West Coast Only Rank
+    WestCoast = df_InputData[['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'Brand_ConstraintTotal']]
+    WestCoast = WestCoast[(WestCoast['FC'] == 'WA') | (WestCoast['FC'] == 'NV') | (WestCoast['FC'] == 'TX')]
+    WestCoast['Brand_ConstraintTotal_rand'] = np.where(WestCoast['Brand_ConstraintTotal'] == 0, 0, WestCoast['Brand_ConstraintTotal'] + WestCoast.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    WestCoast['FC_OrderRank_WC'] = np.where(WestCoast['Brand_ConstraintTotal_rand'] == 0, 99, WestCoast.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTotal_rand'].rank(method='dense', ascending=False))
+    WestCoast = WestCoast.drop(columns=['Brand_ConstraintTotal', 'Brand_ConstraintTotal_rand'])
+    df_InputData = pd.merge(df_InputData, WestCoast, how='left', on=['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])
+    del WestCoast
+        #Coast Adjustment Final Decision
+    df_InputData['Coast_Adjustment_Used'] = np.where((df_InputData['Coast_Adjustment'] == 'Adjust_to_EC') & (df_InputData['FC_OrderRank_WC'] == df_InputData['OrderCount_Original']), 'Remove',
+                                                     np.where((df_InputData['Coast_Adjustment'] == 'Adjust_to_WC') & (df_InputData['FC_OrderRank_EC'] == df_InputData['OrderCount_Original']), 'Remove',
+                                                              np.where((df_InputData['Coast_Adjustment'] == 'Adjust_to_EC') & (df_InputData['FC_OrderRank_EC'] == 1), 'Add',
+                                                                       np.where((df_InputData['Coast_Adjustment'] == 'Adjust_to_WC') & (df_InputData['FC_OrderRank_WC'] == 1), 'Add', 'Normal'))))
+                                                     
+    df_InputData['Baseline_Round_Coast'] = np.where((df_InputData['Brand_CubeWeightUnit_Type'] == 'None') | (df_InputData['Round_Required?'] == 'No_Round'), 0,
+                                                    np.where(df_InputData['Coast_Adjustment_Used'] == 'Add', df_InputData.apply(lambda row: roundup(row['Brand_ConstraintTotal'], row['Constraint_Target']), axis=1) - df_InputData['Brand_ConstraintTotal'],
+                                                        np.where(df_InputData['Coast_Adjustment_Used'] == 'Remove', df_InputData.apply(lambda row: rounddown(row['Brand_ConstraintTotal'], row['Constraint_Target']), axis=1) - df_InputData['Brand_ConstraintTotal'],
+                                                            df_InputData['Baseline_Round'])))
+    df_InputData = df_InputData.drop(columns=['Brand_ConstraintTotalV2', 'Brand_ConstraintTotalV2_Network'])
+    df_InputData['Brand_ConstraintTotalV2'] = df_InputData['Brand_ConstraintTotal'] + df_InputData['Baseline_Round_Coast']
+    df_InputData['Brand_ConstraintTotalV2_Network'] = df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTotalV2'].transform('sum')
+
+        #Order Counts
+    
+    df_InputData['OrderCount_New'] = np.round(df_InputData['Brand_ConstraintTotalV2_Network'] / df_InputData['Constraint_Target'], 0)
+        #Drop Excess Columns
+    df_InputData = df_InputData.drop(columns=['Brand_ConstraintTotal_Network', 'WestCoast_Orig', 'Coast_Adjustment', 'WestCoast_New', 'EastCoast_Orig', 'EastCoast_New', 'FC_OrderRank_EC', 'FC_OrderRank_WC'])
+    
+#Excess Order Count
+    df_InputData['Excess_ShortageOrders'] = df_InputData['OrderCount_New'] - df_InputData['OrderCount_Original']
+        #Rank FC order values to add or remove
+    df_InputData['Brand_ConstraintTotalV2_rand'] = df_InputData['Brand_ConstraintTotalV2'] + np.where(df_InputData['Brand_ConstraintTotalV2'] == 0, 99999999999, df_InputData['Brand_ConstraintTotal'])#np.where(df_InputData['FC'] == 'IN', 0, np.where(df_InputData['FC'] == 'NV', .1, np.where(df_InputData['FC'] == 'PA', .3, np.where(df_InputData['FC'] == 'GA', .4, np.where(df_InputData['FC'] == 'TX', .5, np.where(df_InputData['FC'] == 'NE', .6, np.where(df_InputData['FC'] == 'WA', .7, .8))))))))
+
+        #Updated 8/8/2024 to be the same for every item, per FC 
+        #Updated 3/13/2025 at 3pm to look at constraint target vs the original value for the FC order rank because that is used to remove excess orders so FCs reduced to zero are no longer applicable
+    # df_InputData['Brand_ConstraintTotalV2_rand'] = np.where(df_InputData['Brand_ConstraintTotalV2'] == 0, 99999999999, df_InputData['Brand_ConstraintTarget'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    
+    df_InputData['FC_OrderRank'] = np.where(df_InputData['Brand_ConstraintTotalV2_rand'] == 99999999999, 99, df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTotalV2_rand'].rank(method='dense', ascending=True))
+
+    df_InputData['Baseline_Round_Decision'] = np.where((df_InputData['OrderCount_Original'] == df_InputData['OrderCount_New']) & (df_InputData['Baseline_Round_Decision'] == 'Redistribute') & (df_InputData['OrderCount_Original'] >= df_InputData['FC_OrderRank']),
+                                                       'Round', df_InputData['Baseline_Round_Decision'])
+    
+    #Order Cube/Weight/Units Excess to add / remove
+#3/11 - Need to update this logic to add/remove properly as right now it is adding the extra order to the lowest ranked FC
+#Need to update to remove orders that are already placed based on baseline decision from the ranking if the excess/shortage is less than 0
+#No need to update the cutoffs for east coast weast coast as I don't believe that is doing anything at this point.
+
+    df_InputData['Brand_ConstraintTotalV2_rand'] = df_InputData['Brand_ConstraintTotal'] + np.where(df_InputData['Brand_ConstraintTotal'] == 0, 99999999999, np.where(df_InputData['FC'] == 'IN', 0, np.where(df_InputData['FC'] == 'NV', .1, np.where(df_InputData['FC'] == 'PA', .3, np.where(df_InputData['FC'] == 'GA', .4, np.where(df_InputData['FC'] == 'TX', .5, np.where(df_InputData['FC'] == 'NE', .6, np.where(df_InputData['FC'] == 'WA', .7, .8))))))))
+    
+    df_InputData['FC_OrderRank_NoBaseline'] = np.where(df_InputData['Brand_ConstraintTotalV2_rand'] == 0, 99,
+                                                       np.where(df_InputData['Brand_ConstraintTotalV2'] > 0, 99,
+                                                            np.where(df_InputData['Baseline_Round_Decision'] == 'Round', 99,
+                                                                np.where(df_InputData['Baseline_Round_Decision'] == 'None', 99,
+                                                                    df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTotalV2_rand'].rank(method='dense', ascending=False)))))
+    df_InputData['FC_OrderRank_NoBaseline'] = np.where(df_InputData['FC_OrderRank_NoBaseline'] == 99, 99, df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['FC_OrderRank_NoBaseline'].rank(method='dense', ascending=True))
+
+
+    df_InputData['Excess_Shortage_Add'] = np.where((df_InputData['Excess_ShortageOrders'] < 0) & (df_InputData['FC_OrderRank_NoBaseline'] <= np.abs(df_InputData['Excess_ShortageOrders'])), df_InputData['Constraint_Target'],
+                                                   np.where((df_InputData['Excess_ShortageOrders'] > 0) & (df_InputData['FC_OrderRank'] <= np.abs(df_InputData['Excess_ShortageOrders'])), -df_InputData['Constraint_Target'], 0))
+
+#Final Output Target!
+    df_InputData['FC_OrderCount'] = np.maximum(1, np.round(df_InputData['Brand_ConstraintTotal'] / df_InputData['Constraint_Target'], 0))
+    
+    
+    df_InputData['Brand_ConstraintTarget'] = np.where(df_InputData['Brand_ConstraintTotal'] == 0, 0,
+                                                      np.where(df_InputData['Round_Required?'] == 'No_Round', df_InputData['Brand_ConstraintTotalV2'], 
+                                                      (np.where(df_InputData['Coast_Adjustment_Used'] == 'Add', df_InputData['Constraint_Target'], np.where(df_InputData['Baseline_Round_Decision'] == 'Redistribute', 0, df_InputData['Constraint_Target'])) + df_InputData['Excess_Shortage_Add']) * df_InputData['FC_OrderCount']))
+
+# New Updated / Added 3/13/2025
+    df_InputData['Brand_ConstraintTarget_rand'] = np.where(df_InputData['Brand_ConstraintTarget'] == 0, 99999999999, df_InputData['Brand_ConstraintTarget'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    df_InputData['FC_OrderRank'] = np.where(df_InputData['Brand_ConstraintTarget_rand'] == 99999999999, 99, df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ConstraintTarget_rand'].rank(method='dense', ascending=True))
+    
+    df_InputData['Excess_Shortage_AddV2'] = np.where(df_InputData['FC_OrderRank'] == 99, 0,
+                                                   np.where((df_InputData['Excess_ShortageOrders'] < 0) & (df_InputData['FC_OrderRank_NoBaseline'] <= np.abs(df_InputData['Excess_ShortageOrders'])), df_InputData['Constraint_Target'] - df_InputData['Excess_Shortage_Add'],
+                                                   np.where((df_InputData['Excess_ShortageOrders'] > 0) & (df_InputData['FC_OrderRank'] <= np.abs(df_InputData['Excess_ShortageOrders'])), -df_InputData['Constraint_Target'] - df_InputData['Excess_Shortage_Add'], 0)))
+
+#Updated 3/13/25 at 3pm to remove the filter for redistribute = 0, that should be handled via the Brand_ConstraintTotal
+    df_InputData['Brand_ConstraintTarget'] = np.where(df_InputData['Brand_ConstraintTotal'] == 0, 0,
+                                                      np.where(df_InputData['Round_Required?'] == 'No_Round', df_InputData['Brand_ConstraintTotalV2'],
+                                                      (np.where(df_InputData['Coast_Adjustment_Used'] == 'Add', df_InputData['Constraint_Target'], np.where(df_InputData['Brand_ConstraintTotalV2'] == 0, 0, #np.where(df_InputData['Baseline_Round_Decision'] == 'Redistribute', 0, 
+                                                        np.where((df_InputData['Baseline_Round_Decision'] == 'Round') & ((df_InputData['Baseline_Round'] + df_InputData['Brand_ConstraintTotal']) == 0), 0,
+                                                        df_InputData['Constraint_Target']))) + df_InputData['Excess_Shortage_Add'] + df_InputData['Excess_Shortage_AddV2']) * df_InputData['FC_OrderCount']))
+#End of New/Updated on 3/13/2025
+    
+    df_InputData['CubeWeightUnit_AdjustUsed'] = df_InputData['Brand_ConstraintTarget'] - df_InputData['Brand_ConstraintTotal']
+    df_InputData['RoundDecision_Used'] = np.where((df_InputData['Brand_ConstraintTarget'] == 0) & (df_InputData['Baseline_Round_Decision'] == 'Round'), 'No_Order', np.where(df_InputData['Brand_ConstraintTarget'] > 0, 'Round', df_InputData['Baseline_Round_Decision']))
+    df_InputData = df_InputData.drop(columns=['Baseline_Round', 'Excess_ShortageOrders', 'Excess_Shortage_AddV2', 'Brand_ConstraintTotalV2_rand', 'FC_OrderRank', 'FC_OrderRank_NoBaseline', 'Baseline_Round_Decision', 'FC_OrderCount', 'Brand_ConstraintTarget_rand'])
+
+#Optional View Output
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter((col("ITEMID") == 201434) & (col("ORDERTYPE") == 'import'))# & (col("UPDATED_ORDERTYPE") == 'domestic TOWNSEND') & (col("RFP_ITERATION_COUNT") == 6)); #col("ITEMID") == 400143))
+
+#as of 1040am on 3/13/25 there seems to be an issue when all original decisions are redistribute then the full adjustment occurs on the items for the FC selected vs redistributing as needed or something along those lines
+
+#Redistribution Logic
+        #Redistribution Table Query
+    Redistribution = """
+            Select
+                FC,
+                SEA, LAS, LNK, DFW, IND, AVP, SAV, ONT
+                from INVENTORYSANDBOX.DBO.ER_REDISTRIBUTIONTABLE
+            """
+    Redistribution = session.sql(Redistribution)
+    Redistribution = Redistribution.to_pandas()
+    df_InputData = pd.merge(df_InputData, Redistribution, how='left', on=['FC']) 
+    
+        #Pull Rounding Decision for other FCs to remove from Redistribution %'s
+    fc_values = ['WA', 'NV', 'NE', 'TX', 'IN', 'PA', 'GA']
+    def get_other_decision(row, fc):
+        key_tuple = (row['ITEMID'], fc, row['SUPPLIERID'], row['UPDATED_ORDERTYPE'], row['OTF'], row['LT'], row['CAP_DOS'])
+        return decision_map.get(key_tuple)
+    
+    decision_map = df_InputData.set_index(['ITEMID', 'FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['RoundDecision_Used'].to_dict()
+    for fc in fc_values:
+        df_InputData[f'{fc}_RoundDecision'] = df_InputData.apply(get_other_decision, axis=1, fc=fc)
+        
+        #Remove blank & Redistribute Values from Redistribution Values
+    df_InputData['SEA'] = np.where((df_InputData['WA_RoundDecision'] == 'No_Order') | (df_InputData['WA_RoundDecision'] == 'Redistribute'), 0, df_InputData['SEA'])
+    df_InputData['LAS'] = np.where((df_InputData['NV_RoundDecision'] == 'No_Order') | (df_InputData['NV_RoundDecision'] == 'Redistribute'), 0, df_InputData['LAS'])
+    df_InputData['LNK'] = np.where((df_InputData['NE_RoundDecision'] == 'No_Order') | (df_InputData['NE_RoundDecision'] == 'Redistribute'), 0, df_InputData['LNK'])
+    df_InputData['DFW'] = np.where((df_InputData['TX_RoundDecision'] == 'No_Order') | (df_InputData['TX_RoundDecision'] == 'Redistribute'), 0, df_InputData['DFW'])
+    df_InputData['IND'] = np.where((df_InputData['IN_RoundDecision'] == 'No_Order') | (df_InputData['IN_RoundDecision'] == 'Redistribute'), 0, df_InputData['IND'])
+    df_InputData['AVP'] = np.where((df_InputData['PA_RoundDecision'] == 'No_Order') | (df_InputData['PA_RoundDecision'] == 'Redistribute'), 0, df_InputData['AVP'])
+    df_InputData['SAV'] = np.where((df_InputData['GA_RoundDecision'] == 'No_Order') | (df_InputData['GA_RoundDecision'] == 'Redistribute'), 0, df_InputData['SAV'])
+    df_InputData['ONT'] = 0
+
+        #Total Redistribution Avail & Final Redist %
+    df_InputData['TOTAL_REDIST_AVAIL'] = df_InputData['SEA'] + df_InputData['LAS'] + df_InputData['LNK'] + df_InputData['DFW'] + df_InputData['IND'] + df_InputData['AVP'] + df_InputData['SAV'] + df_InputData['ONT']
+    df_InputData['SEA'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['SEA'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+    df_InputData['LAS'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['LAS'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+    df_InputData['LNK'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['LNK'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+    df_InputData['DFW'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['DFW'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+    df_InputData['IND'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['IND'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+    df_InputData['AVP'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['AVP'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+    df_InputData['SAV'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['SAV'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+    df_InputData['ONT'] = np.where(df_InputData['RoundDecision_Used'] != 'Redistribute', 0, np.round((df_InputData['ONT'] / df_InputData['TOTAL_REDIST_AVAIL']) * df_InputData['OUTPUT_BRANDMOVQTY'], 0))
+
+        #Aggregate for final add to order qty
+    df_InputData['SEA'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SEA'].transform('sum')
+    df_InputData['LAS'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LAS'].transform('sum')
+    df_InputData['LNK'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['LNK'].transform('sum')
+    df_InputData['DFW'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['DFW'].transform('sum')
+    df_InputData['IND'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['IND'].transform('sum')
+    df_InputData['AVP'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['AVP'].transform('sum')
+    df_InputData['SAV'] = df_InputData.groupby(['ITEMID', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['SAV'].transform('sum')
+
+        #Round to item pallet qty
+    df_InputData['ITEM_PALLET_TYPE'].fillna('NONE', inplace=True)
+    df_InputData['ITEM_PALLET_CONSTRAINT'] = np.where(df_InputData['ITEM_PALLET_TYPE'] == 'NONE', 1, df_InputData['ITEM_PALLET_CONSTRAINT'])
+    df_InputData['ITEM_PALLET_CONSTRAINT'].fillna(1, inplace=True)
+    df_InputData['SEA'] = df_InputData.apply(lambda row: mround(row['SEA'], row['ITEM_PALLET_CONSTRAINT']), axis=1)
+    df_InputData['LAS'] = df_InputData.apply(lambda row: mround(row['LAS'], row['ITEM_PALLET_CONSTRAINT']), axis=1)
+    df_InputData['LNK'] = df_InputData.apply(lambda row: mround(row['LNK'], row['ITEM_PALLET_CONSTRAINT']), axis=1)
+    df_InputData['DFW'] = df_InputData.apply(lambda row: mround(row['DFW'], row['ITEM_PALLET_CONSTRAINT']), axis=1)
+    df_InputData['IND'] = df_InputData.apply(lambda row: mround(row['IND'], row['ITEM_PALLET_CONSTRAINT']), axis=1)
+    df_InputData['AVP'] = df_InputData.apply(lambda row: mround(row['AVP'], row['ITEM_PALLET_CONSTRAINT']), axis=1)
+    df_InputData['SAV'] = df_InputData.apply(lambda row: mround(row['SAV'], row['ITEM_PALLET_CONSTRAINT']), axis=1)
+    
+
+        #Final Redistribution Qty
+    df_InputData['Redistribution_Qty_BrandCube'] = np.where(df_InputData['RoundDecision_Used'] == 'Redistribute', -df_InputData['OUTPUT_BRANDMOVQTY'],
+                                                    np.where(df_InputData['FC_CODE'] == 'SEA', df_InputData['SEA'], np.where(df_InputData['FC_CODE'] == 'LAS', df_InputData['LAS'], np.where(df_InputData['FC_CODE'] == 'LNK', df_InputData['LNK'],
+                                                    np.where(df_InputData['FC_CODE'] == 'IND', df_InputData['IND'], np.where(df_InputData['FC_CODE'] == 'AVP', df_InputData['AVP'], np.where(df_InputData['FC_CODE'] == 'SAV', df_InputData['SAV'],
+                                                    np.where(df_InputData['FC_CODE'] == 'DFW', df_InputData['DFW'], np.where(df_InputData['FC_CODE'] == 'ONT', df_InputData['ONT'], 0)))))))))
+        #Drop and replace columns for calculations after redistribution and EC/WC changes
+    df_InputData = df_InputData.drop(columns=['Brand_ItemTotal', 'Brand_ConstraintTotal', 'Brand_ConstraintTotalV2_Network', 'CubeWeightUnit_AdjustUsed'])
+    
+    df_InputData['Brand_ItemTotal'] = np.round(df_InputData['OUTPUT_BRANDMOVQTY'] + df_InputData['Redistribution_Qty_BrandCube'], 0)  
+    df_InputData['Brand_ItemTotal_Constraint'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['Brand_ItemTotal'] * df_InputData['ITEMCUBE'],
+                                                          np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Brand_ItemTotal'] * df_InputData['Item_Weight'], df_InputData['Brand_ItemTotal']))
+    df_InputData['Brand_FCTotal_Constraint'] = df_InputData.groupby(['FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ItemTotal_Constraint'].transform('sum')
+    df_InputData['Brand_NetTotal_Constraint'] = df_InputData.groupby(['SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ItemTotal_Constraint'].transform('sum')
+    df_InputData['CubeWeightUnit_AdjustUsed'] = df_InputData['Brand_ConstraintTarget'] - df_InputData['Brand_FCTotal_Constraint']
+        #Drop further excess columns
+    df_InputData = df_InputData.drop(columns=['Brand_ConstraintTotalV2', 'Baseline_Round_Coast', 'Redistribution_Qty_BrandCube', 'SEA', 'LAS', 'LNK', 'DFW', 'IND', 'AVP', 'SAV', 'ONT', 'WA_RoundDecision', 'NV_RoundDecision', 'NE_RoundDecision', 'TX_RoundDecision', 'IN_RoundDecision', 'PA_RoundDecision', 'GA_RoundDecision', 'TOTAL_REDIST_AVAIL'])
+
+# #Optional View Output
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter((col("SUPPLIERID") == 1896))# & (col("ITEMID") == 400143))# & (col("UPDATED_ORDERTYPE") == 'domestic TOWNSEND') & (col("RFP_ITERATION_COUNT") == 6)); #col("ITEMID") == 400143))
+
+    
+#Calculate Min Adjust Units & Baseline Round to Hit Target
+    df_InputData['Item_MinAdjust_Units'] = np.ceil(np.where(df_InputData['ITEM_PALLET_TYPE'] == 'Req', df_InputData['ITEM_PALLET_CONSTRAINT'], 1), df_InputData['CASEQUANTITY'])
+    df_InputData['Item_MinAdjust_Constraint'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['Item_MinAdjust_Units'] * df_InputData['ITEMCUBE'],
+                                                          np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Item_MinAdjust_Units'] * df_InputData['Item_Weight'], df_InputData['Item_MinAdjust_Units']))
+    df_InputData['Item_FCOrderPercent'] = np.where(df_InputData['Brand_ItemTotal_Constraint'] == 0, 0, 
+                                                   df_InputData['Brand_ItemTotal_Constraint'] / df_InputData.groupby(['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ItemTotal_Constraint'].transform('sum'))
+    df_InputData['Item_AdjustV1'] = df_InputData['Item_FCOrderPercent'] * df_InputData['CubeWeightUnit_AdjustUsed']
+    df_InputData['RoundV1'] = df_InputData.apply(lambda row: mround(row['Item_AdjustV1'], row['Item_MinAdjust_Constraint']), axis=1)
+    df_InputData['RoundV1_Units'] = df_InputData['RoundV1'] / np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['ITEMCUBE'], 
+                                                                       np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Item_Weight'], 1))
+    df_InputData['RoundV1_Cost'] = df_InputData['RoundV1_Units'] * df_InputData['FIFOAVERAGECOST']
+        #Adjust Round for Item MOV/MOQ
+    df_InputData['RoundV1_Units_Net'] = df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['RoundV1_Units'].transform('sum')
+    df_InputData['RoundV1_Cost_Net'] = df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['RoundV1_Cost'].transform('sum')
+
+#Updated 8/9/2024 for MOQ and MOV constraint to add the round units and cost to the total outouts vs just the round alone
+    df_InputData['Output_BrandMOVQty_Net'] = df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['OUTPUT_BRANDMOVQTY'].transform('sum')
+    df_InputData['OUTPUT_BRANDMOVCOST_Net'] = df_InputData.groupby(['ITEMID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['OUTPUT_BRANDMOVCOST'].transform('sum')
+    
+    df_InputData['Item_MOQV_Adjust'] = np.where((df_InputData['ITEM_MOQMOV_TYPE'] == 'MOV, Per Ship') & ((df_InputData['RoundV1_Cost'] + df_InputData['OUTPUT_BRANDMOVCOST']) < df_InputData['ITEM_CONSTRAINT_USED']), 'Remove',
+                                                np.where((df_InputData['ITEM_MOQMOV_TYPE'] == 'MOQ, Per Ship') & ((df_InputData['RoundV1_Units'] + df_InputData['OUTPUT_BRANDMOVQTY']) < df_InputData['ITEM_CONSTRAINT_USED']), 'Remove',
+                                                         np.where((df_InputData['ITEM_MOQMOV_TYPE'] == 'MOV, Per Mast') & ((df_InputData['RoundV1_Cost_Net'] + df_InputData['OUTPUT_BRANDMOVCOST_Net']) < df_InputData['ITEM_CONSTRAINT_USED']), 'Remove',
+                                                                  np.where((df_InputData['ITEM_MOQMOV_TYPE'] == 'MOQ, Per Mast') & ((df_InputData['RoundV1_Units_Net'] + df_InputData['Output_BrandMOVQty_Net']) < df_InputData['ITEM_CONSTRAINT_USED']), 'Remove', 'Keep'))))
+
+    df_InputData['Item_AdjustV2'] = np.where(df_InputData['RoundV1_Units'] >= 0, df_InputData['RoundV1'],
+                                             np.where(df_InputData['Item_MOQV_Adjust'] == 'Remove', 0, df_InputData['Item_AdjustV1']))
+    df_InputData['RoundV2'] = df_InputData.apply(lambda row: mround(row['Item_AdjustV2'], row['Item_MinAdjust_Constraint']), axis=1)
+    df_InputData['RoundV2_Units'] = df_InputData['RoundV2'] / np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['ITEMCUBE'], 
+                                                                       np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Item_Weight'], 1))
+    df_InputData = df_InputData.drop(columns=['Item_AdjustV1', 'RoundV1', 'RoundV1_Units', 'RoundV1_Cost', 'RoundV1_Units_Net', 'RoundV1_Cost_Net'])
+
+#Calculate outputs and the variance from target given first round; Are they acceptable outputs?
+    df_InputData = df_InputData.drop(columns=['Brand_FCTotal_Constraint', 'Brand_NetTotal_Constraint'])
+    df_InputData['Brand_ItemTotalV2'] = df_InputData['Brand_ItemTotal'] + df_InputData['RoundV2_Units']
+    df_InputData['Brand_ItemTotalV2_Constraint'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['Brand_ItemTotalV2'] * df_InputData['ITEMCUBE'], 
+                                                                       np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Brand_ItemTotalV2'] * df_InputData['Item_Weight'], df_InputData['Brand_ItemTotalV2']))
+    df_InputData['Brand_FCTotal_Constraint'] = df_InputData.groupby(['FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ItemTotalV2_Constraint'].transform('sum')
+    df_InputData['Brand_NetTotal_Constraint'] = df_InputData.groupby(['SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ItemTotalV2_Constraint'].transform('sum')
+    
+    
+    df_InputData['Min_Round'] = df_InputData.apply(lambda row: rounddown(row['Brand_FCTotal_Constraint'], row['Brand_CubeWeightUnit_Constraint_Lower']), axis=1) / df_InputData['Brand_CubeWeightUnit_Constraint_Lower']
+    df_InputData['Max_Round'] = df_InputData.apply(lambda row: rounddown(row['Brand_FCTotal_Constraint'], row['Brand_CubeWeightUnit_Constraint_Upper']), axis=1) / df_InputData['Brand_CubeWeightUnit_Constraint_Upper']
+    df_InputData['RoundV2_AcceptableOutput'] = np.where(df_InputData['Brand_FCTotal_Constraint'] == 0, 'Yes',
+                                               np.where(df_InputData['Min_Round'] == df_InputData['Max_Round'], 'No', 'Yes'))
+    df_InputData['RoundV2_OutputVar'] = np.where(df_InputData['Brand_FCTotal_Constraint'] == 0, 0, df_InputData['Brand_ConstraintTarget'] - df_InputData['Brand_FCTotal_Constraint'])
+
+#If Output from RoundV2 does not result in acceptable output, following section is required to meet expectation
+    df_InputData['Brand_ItemTotalV2_Constraint_rand'] = np.where(df_InputData['Brand_ItemTotalV2_Constraint'] == 0, 0, df_InputData['Brand_ItemTotalV2_Constraint'] + df_InputData.apply(lambda row: random.uniform(0, 0.25), axis=1))
+    df_InputData['AddRound_ItemRank'] = np.where((df_InputData['Brand_ItemTotalV2_Constraint_rand'] == 0) | (df_InputData['Item_MOQV_Adjust'] == 'Remove'), 9999,
+                                                 df_InputData.groupby(['FC', 'SUPPLIERID', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Brand_ItemTotalV2_Constraint_rand'].rank(method='dense', ascending=False))
+    
+    df_InputData.sort_values(by=['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'AddRound_ItemRank'], inplace=True)
+    df_InputData['Cumulative_Adjust_Avail'] = np.where(df_InputData['AddRound_ItemRank'] == 9999, 99999999,
+                                                       df_InputData.groupby(['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Item_MinAdjust_Constraint'].cumsum() - df_InputData['Item_MinAdjust_Constraint'])
+    
+    df_InputData['Total_Adjust_Avail'] = df_InputData[(df_InputData['Brand_ItemTotalV2_Constraint_rand'] > 0) & (df_InputData['Item_MOQV_Adjust'] != 'Remove')].groupby(['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Item_MinAdjust_Constraint'].transform('sum')
+    df_InputData['Total_Adjust_Avail'].fillna(0, inplace=True)
+    
+    df_InputData['Rounds_RequiredV1'] = df_InputData['RoundV2_OutputVar'] / df_InputData['Total_Adjust_Avail'] 
+    df_InputData['Rounds_Required_Used'] = np.where(df_InputData['Rounds_RequiredV1'] < 0, df_InputData.apply(lambda row: rounddown(row['Rounds_RequiredV1'], 1), axis=1),
+                                                    np.where(df_InputData['Rounds_RequiredV1'] > 0, df_InputData.apply(lambda row: roundup(row['Rounds_RequiredV1'], 1), axis=1), 0))
+        
+        
+        #Update 9/2/24 to cap round 25% of original, update the required round count
+    #Determine max round count per item, row
+    df_InputData['Rounds_Avail'] = np.where(df_InputData['Item_MOQV_Adjust'] == 'Remove', 0, np.round((df_InputData['Brand_ItemTotalV2'] * .75) / df_InputData['Item_MinAdjust_Units'], 0))
+    df_InputData['Rounds_Avail'] = np.where(df_InputData['Rounds_Required_Used'] < 0, np.maximum(-df_InputData['Rounds_Avail'], df_InputData['Rounds_Required_Used']), np.minimum(df_InputData['Rounds_Avail'], df_InputData['Rounds_Required_Used']))
+    df_InputData['Rounds_Avail'] = df_InputData['Rounds_Avail'] * df_InputData['Item_MinAdjust_Constraint']
+    #df_InputData['Rounds_Avail_Total'] = df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Rounds_Avail'].transform('sum')           
+
+    df_InputData['TEST_SETUP'] = np.where(df_InputData['Item_MOQV_Adjust'] == 'Remove', 0, np.round((df_InputData['Brand_ItemTotalV2'] * .75) / df_InputData['Item_MinAdjust_Units'], 0))
+    df_InputData['TEST'] = np.where(df_InputData['Rounds_Required_Used'] < 0, -np.round(df_InputData['TEST_SETUP'], 0), np.round(df_InputData['TEST_SETUP'], 0))
+    df_InputData['Round_Limited'] = np.where(df_InputData['Item_MOQV_Adjust'] == 'Remove', 'Yes', 
+                                             np.where(np.abs(df_InputData['Rounds_Avail'] / df_InputData['Item_MinAdjust_Constraint']) < np.abs(df_InputData['Rounds_Required_Used']), 'Yes', 'No'))
+        #Sum of cumulative total of item adjustment where it is not limited
+    df_InputData['Cumulative_Adjust_AvailV2'] = df_InputData.loc[df_InputData['Round_Limited'] == 'No'].groupby(['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Item_MinAdjust_Constraint'].cumsum()
+    df_InputData['Cumulative_Adjust_AvailV2'].fillna(99999999, inplace=True)
+    df_InputData['Rounds_Avail'] = np.where(df_InputData['Round_Limited'] == 'Yes', 0, df_InputData['Rounds_Avail'])
+    df_InputData['Rounds_Avail_Total'] = df_InputData.groupby(['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Rounds_Avail'].transform('sum') 
+
+#Critical function for final round
+    #df_InputData['Round_Min'] = np.minimum(np.abs(df_InputData['RoundV2_OutputVar']), np.abs(df_InputData['Rounds_Avail_Total']))
+    #df_InputData['Round_Max'] = np.maximum(np.abs(df_InputData['RoundV2_OutputVar']), np.abs(df_InputData['Rounds_Avail_Total']))
+
+    df_InputData['Rounds_Avail_Single'] = df_InputData['Rounds_Avail_Total'] / np.abs(df_InputData['Rounds_Required_Used'])
+    df_InputData['Adjust_Missing'] = df_InputData['RoundV2_OutputVar'] - df_InputData['Rounds_Avail_Total']
+    
+    df_InputData['Adjust_Type'] = np.where((df_InputData['Rounds_Avail_Total'] > 0) & (df_InputData['Rounds_Avail_Total'] > df_InputData['RoundV2_OutputVar']), 'Round_Less',
+                                           np.where((df_InputData['Rounds_Avail_Total'] > 0) & (df_InputData['Rounds_Avail_Total'] < df_InputData['RoundV2_OutputVar']), 'Round_More',
+                                                    np.where((df_InputData['Rounds_Avail_Total'] < 0) & (df_InputData['Rounds_Avail_Total'] > df_InputData['RoundV2_OutputVar']), 'Round_More',
+                                                             np.where((df_InputData['Rounds_Avail_Total'] < 0) & (df_InputData['Rounds_Avail_Total'] < df_InputData['RoundV2_OutputVar']), 'Round_Less',''))))
+
+    df_InputData['RoundAdjust_RankCutoff'] = np.where(df_InputData['Adjust_Type'] == 'Round_Less', df_InputData['Rounds_Avail_Single'] + df_InputData['Adjust_Missing'],
+                                                      np.where(df_InputData['Adjust_Type'] == 'Round_More', df_InputData['Adjust_Missing'], 0))
+
+    #If RoundAdjust cuttoff works, this can be removed    
+    # df_InputData['Round_Missing'] = np.where(np.abs(df_InputData['Rounds_RequiredV1']) < 1,
+    #                                          np.abs(df_InputData['RoundV2_OutputVar']),
+    #                                          (np.abs(df_InputData['RoundV2_OutputVar']) - np.abs(df_InputData['Total_Adjust_Avail'])) * 1.05)
+    #                                          #df_InputData['RoundV2_OutputVar'] - df_InputData['Rounds_Avail_Total'])  
+    
+        #Only apply adjustment to non-capped quantities
+    df_InputData['Round_CountAdjustStep1'] = np.where((df_InputData['RoundAdjust_RankCutoff'] > 0) & (df_InputData['Adjust_Type'] == 'Round_Less'), -1,
+                                           np.where((df_InputData['RoundAdjust_RankCutoff'] < 0) & (df_InputData['Adjust_Type'] == 'Round_Less'), 1,
+                                                    np.where((df_InputData['RoundAdjust_RankCutoff'] > 0) & (df_InputData['Adjust_Type'] == 'Round_More'), 1,
+                                                             np.where((df_InputData['RoundAdjust_RankCutoff'] < 0) & (df_InputData['Adjust_Type'] == 'Round_More'), -1, 0))))
+
+    df_InputData['Round_CountAdjust'] = np.where(df_InputData['Cumulative_Adjust_AvailV2'] == 99999999, 'None', 
+                                                 np.where((df_InputData['Rounds_Avail_Total'] > 0) & (df_InputData['Rounds_Avail_Total'] > df_InputData['RoundV2_OutputVar']), 'Above_Cutoff',
+                                                    np.where((df_InputData['Rounds_Avail_Total'] > 0) & (df_InputData['Rounds_Avail_Total'] < df_InputData['RoundV2_OutputVar']), 'Below_Cutoff',
+                                                        np.where((df_InputData['Rounds_Avail_Total'] < 0) & (df_InputData['Rounds_Avail_Total'] > df_InputData['RoundV2_OutputVar']), 'Below_Cutoff',
+                                                             np.where((df_InputData['Rounds_Avail_Total'] < 0) & (df_InputData['Rounds_Avail_Total'] < df_InputData['RoundV2_OutputVar']), 'Above_Cutoff','None')))))
+
+
+    df_InputData['Round_CountAdjust'] = np.where(df_InputData['Round_CountAdjust'] == 'None', 0,
+                                                 np.where((df_InputData['Round_CountAdjust'] == 'Above_Cutoff') & (df_InputData['Cumulative_Adjust_AvailV2'] >= np.abs(df_InputData['RoundAdjust_RankCutoff'])), df_InputData['Round_CountAdjustStep1'],
+                                                          np.where((df_InputData['Round_CountAdjust'] == 'Below_Cutoff') & (df_InputData['Cumulative_Adjust_AvailV2'] <= np.abs(df_InputData['RoundAdjust_RankCutoff'])), df_InputData['Round_CountAdjustStep1'],
+                                                                   0))) #* np.maximum(1, (np.round(df_InputData['Adjust_Missing'] / df_InputData['Rounds_Avail_Single'], 0) - np.abs(df_InputData['Rounds_Required_Used'])))
+    #df_InputData['Multiplier_Test'] = np.maximum(1, (np.round(df_InputData['Adjust_Missing'] / df_InputData['Rounds_Avail_Single'], 0) - np.abs(df_InputData['Rounds_Required_Used'])))
+    
+    # df_InputData['Round_CountAdjust'] = np.where(df_InputData['Cumulative_Adjust_AvailV2'] == 99999999, 0, 
+    #                                              np.where(df_InputData['Cumulative_Adjust_AvailV2'] >= np.abs(df_InputData['Round_Missing']),
+    #                                                       np.where(df_InputData['Rounds_Required_Used'] < 0, 1, np.where(df_InputData['Rounds_Required_Used'] > 0, -1, 0)), 0))
+    df_InputData['Rounds_Required_UsedV1'] = df_InputData['Rounds_Required_Used']
+    df_InputData['Rounds_Required_Used'] = np.where(df_InputData['Rounds_Required_Used'] < 0, np.maximum(df_InputData['TEST'], df_InputData['Rounds_Required_Used']) + df_InputData['Round_CountAdjust'],
+                                                    np.minimum(df_InputData['TEST'], df_InputData['Rounds_Required_Used']) + df_InputData['Round_CountAdjust'])
+
+
+    
+    df_InputData['FinalRoundRemaining'] = df_InputData['Rounds_Required_Used'] * df_InputData['Item_MinAdjust_Units']
+    #df_InputData['FinalRoundRemaining'] = df_InputData['RoundV2_OutputVar'] - (np.where(df_InputData['RoundV2_OutputVar'] < 0, -1, 1) * (df_InputData['Total_Adjust_Avail'] * np.ceil(0, np.abs(df_InputData['Rounds_Required_Used']) - 1)))
+
+        #Updated 8/9/2024 to multiply the adjustment units against the number of rounds required to provide an accurate output
+    # df_InputData['Final_Adjustment'] = np.where(df_InputData['Brand_FCTotal_Constraint'] == 0, 0, 
+    #                                             np.where(df_InputData['RoundV2_AcceptableOutput'] == 'Yes', 0, 
+    #                                                      np.where(df_InputData['Cumulative_Adjust_Avail'] <= np.abs(df_InputData['FinalRoundRemaining'] * 1.05), df_InputData['Item_MinAdjust_Units'] * df_InputData['Rounds_Required_Used'], 0)))
+    
+    df_InputData['Final_Adjustment'] = np.where(df_InputData['Brand_FCTotal_Constraint'] == 0, 0, 
+                                                np.where(df_InputData['RoundV2_AcceptableOutput'] == 'Yes', 0, 
+                                                         df_InputData['FinalRoundRemaining']))
+
+#Drop Excess Columns
+    df_InputData = df_InputData.drop(columns=['Rounds_Avail_Single', 'Adjust_Missing', 'RoundAdjust_RankCutoff', 'Round_CountAdjustStep1', 'FinalRoundRemaining', 'Rounds_Required_Used', 'Rounds_RequiredV1', 'Total_Adjust_Avail', 'Cumulative_Adjust_Avail', 'Brand_ItemTotalV2_Constraint_rand'])
+
+#Final Output
+    df_InputData['BrandCube_TotalAdjust'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'None', 0, 
+                                                     (df_InputData['Brand_ItemTotalV2'] + df_InputData['Final_Adjustment']) - df_InputData['OUTPUT_BRANDMOVQTY'])
+    df_InputData['Brand_ItemTotalV2'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'None', df_InputData['OUTPUT_BRANDMOVQTY'], 
+                                                 df_InputData['Brand_ItemTotalV2'])
+    df_InputData['Output_BrandCubeQty'] = np.round(np.maximum(0, np.where(np.round(df_InputData['Brand_ConstraintTarget'], 0) == 0, 0, df_InputData['Brand_ItemTotalV2'] + df_InputData['Final_Adjustment'])), 0)
+    df_InputData['Output_BrandCubeCost'] = df_InputData['Output_BrandCubeQty'] * df_InputData['FIFOAVERAGECOST']
+    df_InputData['Output_BrandCubeCube'] = df_InputData['Output_BrandCubeQty'] * df_InputData['ITEMCUBE']
+    df_InputData['Output_BrandCubeWeight'] = df_InputData['Output_BrandCubeQty'] * df_InputData['Item_Weight']
+    df_InputData['Output_BrandCubeConstraint_Item'] = np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Cube', df_InputData['Output_BrandCubeCube'],
+                                                               np.where(df_InputData['Brand_CubeWeightUnit_Type'] == 'Weight', df_InputData['Output_BrandCubeWeight'], df_InputData['Output_BrandCubeQty']))
+    df_InputData['Output_BrandCubeConstraint_FC'] = df_InputData.groupby(['SUPPLIERID', 'FC', 'UPDATED_ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_BrandCubeConstraint_Item'].transform('sum')
+        #Final Drop & rename columns
+    df_InputData = df_InputData.drop(columns=['Round_CountAdjust', 'Cumulative_Adjust_AvailV2', 'Rounds_Avail', 'Rounds_Avail_Total', 'TEST_SETUP', 'TEST', 'Item_Weight', 'Output_BrandPalletWeight', 'Final_Adjustment', 'AddRound_ItemRank', 'RoundV2_OutputVar', 'Min_Round', 'Max_Round', 'Brand_NetTotal_Constraint', 'Brand_FCTotal_Constraint', 'Brand_ItemTotalV2_Constraint', 'Brand_ItemTotalV2', 'RoundV2_Units', 'RoundV2', 'Item_AdjustV2', 'Item_FCOrderPercent', 'Item_MinAdjust_Constraint', 'Item_MinAdjust_Units', 'CubeWeightUnit_AdjustUsed', 'Brand_ItemTotal_Constraint', 'Brand_ItemTotal', 'Excess_Shortage_Add', 'OrderCount_Original', 'OrderCount_New', 'Output_BrandPalletCube'])
+    df_InputData = df_InputData.rename(columns={'RoundV2_AcceptableOutput': 'BrandCube_AcceptOutput'}) #Old Name, New Name
+    df_InputData = df_InputData.rename(columns={'Item_MOQV_Adjust': 'BrandCube_ItemMOQV_Adjust'})
+    df_InputData = df_InputData.rename(columns={'RoundDecision_Used': 'BrandCube_RoundDecisionV2'})
+    df_InputData = df_InputData.rename(columns={'Brand_ConstraintTarget': 'BrandCube_Target'})
+    df_InputData = df_InputData.rename(columns={'Coast_Adjustment_Used': 'BrandCube_Coast_Adjust'})
+    df_InputData = df_InputData.rename(columns={'Round_Required?': 'BrandCube_RoundDecisionV1'})
+    df_InputData = df_InputData.rename(columns={'Constraint_Target': 'BrandCube_Constraint_Target'})
+    df_InputData = df_InputData.rename(columns={'Brand_CubeWeightUnit_Constraint_Lower': 'BrandCube_Constraint_Lower'})
+    df_InputData = df_InputData.rename(columns={'Brand_CubeWeightUnit_Constraint_Upper': 'BrandCube_Constraint_Upper'})
+
+#Optional View Output
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter((col("SUPPLIERID") == 386) & (col("UPDATED_ORDERTYPE") == 'domestic BIRMINGHAM') & (col("RFP_ITERATION_COUNT") == 2)); #col("ITEMID") == 253177))
+
+#Generate Output Table
+    # # Adjust Warehouse Size
+    # session.sql("ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'MEDIUM'").collect()
+
+    iteration_count = df_InputData['RFP_ITERATION_COUNT'].iloc[0]
+
+    if iteration_count == 1:
+        session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_IB_optimizationV3')
+    else:
+        session.create_dataframe(df_InputData).write.mode("append").saveAsTable('inventorysandbox.DBO.RFP_Simulation_IB_optimizationV3')
+
+
+#Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter((col("OTF") == 49) & (col("LT") == 105) & (col("FC") == 'IN')); #col("ITEMID") == 253177))
+#Dont forget to re-add drop columns if changed during testing
+
+    #to avoid error
+    return(session.create_dataframe([1]))
