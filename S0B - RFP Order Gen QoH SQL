@@ -1,13 +1,24 @@
+--UPDATE FROM TESTING -> CHANGE ALL .TEST ING to .DBO
+--DIFFERENCES FROM DAILY:
+    --_Sim ulation to _Sim utliation_Daily
+--DIFFERENCES FROM CURRENT:
+    --_CURRENT to _Simulation
+    --Add additional OTF types as needed, split between two iterations; Update the source
+    --Update warehouse size to XLarge
+    --Add procurement status filter
+
 create or replace task Step_OB_RFPGen_Simulation
     warehouse = INVENTORYMODEL_WH
     as begin
 
 ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'XLarge';
 
+-- INSERT INTO INVENTORYSANDBOX.DBO.RFP_PROCEDURE_TIMING_DATA (ITERATION_COUNT, TIMESTAMP) SELECT 0 AS STEP_COUNT, CONVERT_TIMEZONE('America/Chicago', CURRENT_TIMESTAMP()) AS TIMESTAMP;
+
 -- Query Summary Guide Available here:
 -- Developer: Erik R
 -- Validation: 
--- Last Updated: 11/4/2024 by Erik R
+-- Last Updated: 12/9/2024 by Erik R
 
 -- Update Notes:
 -- 09/18/2024 - Done - Created initial logic, output
@@ -19,10 +30,10 @@ from INVENTORYSANDBOX.DBO.ER_TEMP_OTF_RFP
 Where CAST(SUPPLIERID AS STRING) IS NOT NULL
   AND CAST(SUPPLIERID AS STRING) <> 'NULL'
   --Primary Filters
-  --AND OTF_TYPE IN ('MIN', 'PLUS_7', 'PLUS_14', 'PLUS_21', 'PLUS_28') -- Step 0A
+  -- AND OTF_TYPE IN ('MIN', 'PLUS_7', 'PLUS_14', 'PLUS_21', 'PLUS_28') -- Step 0A
   AND OTF_TYPE IN ('PLUS_35', 'PLUS_42', 'PLUS_49', 'PLUS_56', 'PLUS_63') -- Step 0B
-);
 
+);
 create or replace temp table Cumulative_Calc as (
 Select --top 10000
     QoH.ITEMID,
@@ -30,86 +41,86 @@ Select --top 10000
     STATE,
     DATEVALUE,
     OTF,
-    LT,
+    (round(greatest(1, LT / 7), 0) * 7) as LT,
     otf.OTF_TYPE,
     otf.LT_Type,
     otf.ORDERTYPE,
     DAYSFROMTODAY,
-    DAYSFROMTODAY - otf.LT as UPDATED_DAYSFROMTODAY,
+    DAYSFROMTODAY - (round(greatest(1, otf.LT / 7), 0) * 7) as UPDATED_DAYSFROMTODAY,
     FORECAST,
     ENDING_PREDICTIVEQOH as node_qoh,
     TOTALRECEIPT as total_receipt,
     FORECAST as baseline_forecast
 FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT QoH
-LEFT JOIN lakehouse.spreedw_dim.product prod on prod.itemid = QoH.itemid
-LEFT JOIN otf on CAST(otf.SUPPLIERID AS STRING) = CAST(prod.supplierid AS STRING) 
-               AND CAST(otf.SUPPLIERID AS STRING) IS NOT NULL 
-               AND CAST(otf.SUPPLIERID AS STRING) <> 'NULL'
-WHERE DAYSFROMTODAY >= (otf.LT + 0)
-AND DAYSFROMTODAY <= (otf.LT + 110)
-AND prod.PROCUREMENTSTATUS = 'Replenish' 
-AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish'
---AND QoH.ITEMID = 408057
---AND otf.OTF = 21
---AND otf.ORDERTYPE = 'domestic'
-
-
+    LEFT JOIN lakehouse.spreedw_dim.product prod on prod.itemid = QoH.itemid
+    LEFT JOIN otf on CAST(otf.SUPPLIERID AS STRING) = CAST(prod.supplierid AS STRING) 
+                   AND CAST(otf.SUPPLIERID AS STRING) IS NOT NULL 
+                   AND CAST(otf.SUPPLIERID AS STRING) <> 'NULL'
+WHERE DAYSFROMTODAY >= (round(greatest(1, otf.LT / 7), 0) * 7)
+    AND DAYSFROMTODAY <= ((round(greatest(1, otf.LT / 7), 0) * 7) + 110)
+    AND prod.PROCUREMENTSTATUS = 'Replenish' 
+    AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish'
+    -- AND QoH.ITEMID = 119381
+    --AND otf.OTF = 21
+    -- AND otf.ORDERTYPE = 'domestic'
+  
+  
 ---------------(Step 2) Critical Step that Generates Predictive QoH given Forecast, On Order and Original QoH-------------
 );
-
 create or replace temp table recursive_predictive as (  
-with recursive_predictive as (
-select 
-    itemid,
-    OTF_TYPE,
-    LT_Type,
-    ORDERTYPE,
-    originid,
-    STATE,
-    DATEVALUE,
-    daysfromtoday,
-    UPDATED_DAYSFROMTODAY,
-    node_qoh,
-    total_receipt,
-    baseline_forecast as forecast,
-    forecast as gradeadj_forecast,
-    cast(greatest(0, node_qoh) as float) as predictive_qoh
-    --cast(greatest(0, node_qoh - baseline_forecast) + total_receipt as float) as predictive_qoh
-from cumulative_calc
-where UPDATED_DAYSFROMTODAY = 0
- -- and 1=0
-
-union all
-
--- recursive part
-select 
-    c.itemid,
-    c.OTF_TYPE,
-    c.LT_Type,
-    c.ORDERTYPE,
-    c.originid,
-    c.STATE,
-    c.DATEVALUE,
-    c.daysfromtoday,
-    c.UPDATED_DAYSFROMTODAY,
-    c.node_qoh, 
-    c.total_receipt,
-    c.baseline_forecast as forecast,
-    c.forecast as gradeadj_forecast,
-    cast(
-        case 
-            when r.predictive_qoh <= 0
-            then greatest(0, r.predictive_qoh + c.total_receipt) 
-            else greatest(0, r.predictive_qoh - c.baseline_forecast) + c.total_receipt
-            end as float
-        ) as predictive_qoh
-from cumulative_calc c
-    join recursive_predictive r on c.itemid = r.itemid and c.originid = r.originid and c.daysfromtoday = r.daysfromtoday + 1 and c.daysfromtoday <= 365 and r.ORDERTYPE = c.ORDERTYPE AND r.OTF_TYPE = c.OTF_TYPE and r.LT_TYPE = c.LT_TYPE)
-
-        select *
-        from recursive_predictive);
+    with recursive_predictive as (
+    select 
+        itemid,
+        OTF_TYPE,
+        LT_Type,
+        ORDERTYPE,
+        originid,
+        STATE,
+        DATEVALUE,
+        daysfromtoday,
+        UPDATED_DAYSFROMTODAY,
+        node_qoh,
+        total_receipt,
+        baseline_forecast as forecast,
+        forecast as gradeadj_forecast,
+        cast(greatest(0, node_qoh) as float) as predictive_qoh
+        --cast(greatest(0, node_qoh - baseline_forecast) + total_receipt as float) as predictive_qoh
+    from cumulative_calc
+    where UPDATED_DAYSFROMTODAY = 0
+     -- and 1=0
     
-INSERT INTO inventorysandbox.dbo.RFP_ordering_predQoH (
+    union all
+    
+    -- recursive part
+    select 
+        c.itemid,
+        c.OTF_TYPE,
+        c.LT_Type,
+        c.ORDERTYPE,
+        c.originid,
+        c.STATE,
+        c.DATEVALUE,
+        c.daysfromtoday,
+        c.UPDATED_DAYSFROMTODAY,
+        c.node_qoh, 
+        c.total_receipt,
+        c.baseline_forecast as forecast,
+        c.forecast as gradeadj_forecast,
+        cast(
+            case 
+                when r.predictive_qoh <= 0
+                then greatest(0, r.predictive_qoh + c.total_receipt) 
+                else greatest(0, r.predictive_qoh - c.baseline_forecast) + c.total_receipt
+                end as float
+            ) as predictive_qoh
+    from cumulative_calc c
+        join recursive_predictive r on c.itemid = r.itemid and c.originid = r.originid and c.daysfromtoday = r.daysfromtoday + 1 and c.daysfromtoday <= 365 and r.ORDERTYPE = c.ORDERTYPE AND r.OTF_TYPE = c.OTF_TYPE and r.LT_TYPE = c.LT_TYPE)
+        
+        select *
+        from recursive_predictive
+        );
+
+INSERT INTO inventorysandbox.DBO.RFP_ordering_predQoH (
     ITEMID,
     FC,
     DATEVALUE,
@@ -119,21 +130,25 @@ INSERT INTO inventorysandbox.dbo.RFP_ordering_predQoH (
     PredictedQoH,
     LastModified
 )
-
-SELECT 
-    r.ITEMID,
-    r.STATE as FC,
-    r.DATEVALUE,
-    r.OTF_Type,
-    r.LT_Type,
-    r.ORDERTYPE,
-    r.predictive_qoh as PredictedQoH,
-    current_date as LastModified
-FROM recursive_predictive as r;
+                    
+-- create or replace table INVENTORYSANDBOX.DBO.RFP_Simulation_ordering_predQoH as (            
+            select 
+                r.ITEMID,
+                r.STATE as FC,
+                r.DATEVALUE,
+                r.OTF_Type,
+                r.LT_Type,
+                r.ORDERTYPE,
+                r.predictive_qoh as PredictedQoH,
+                current_date as LastModified
+            from recursive_predictive as r;
+-- );
 
 ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'MEDIUM';
 
-create or replace table inventorysandbox.dbo.RFP_Sim_Process_Count as (
+-- INSERT INTO INVENTORYSANDBOX.DBO.RFP_PROCEDURE_TIMING_DATA (ITERATION_COUNT, TIMESTAMP) SELECT 1 AS STEP_COUNT, CONVERT_TIMEZONE('America/Chicago', CURRENT_TIMESTAMP()) AS TIMESTAMP;
+
+create or replace table INVENTORYSANDBOX.DBO.RFP_Simulation_Process_Count as (
 Select 1 as "Iteration");
 
 execute task INVENTORYSANDBOX.DBO.Step_1A_RFPGen_Simulation;
