@@ -1,0 +1,1032 @@
+#Python Code Created by: Erik R
+#Code Last Updated: 1/17/2025
+#Procedure Name: Step_3_RFPGen_Simulation
+#Code Guide Avail Here:
+#Procedure Operation:
+    #First Iteration: 1 -> 2 -> 4 -> 5 -> 6
+    #2Plus Iteration: 3 -> 2 -> 4 -> 5 -> 7 (Loop as many times as needed)
+
+#To Do
+
+#Update Notes:
+#12/30/2024 - Updated freight CPC to account for pallet multipliers to improve excel vs python alignment
+#01/17/2025 - Updated the source of OOS redistribution % to pull from John/Chris direct source
+
+import snowflake.snowpark as snowpark
+import numpy as np
+import pandas as pd
+import random
+from snowflake.snowpark.functions import col, lit
+from datetime import *
+
+def main(session: snowpark.Session):
+###################
+    #Input Setup Below
+###################
+
+#Adjust Warehouse Size
+    update_command = "ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'MEDIUM'"
+    session.sql(update_command).collect()
+
+    
+#Gather Order Information from Step 9 of IB Opt.
+    InputData = """
+With OOSREDISTRIBUTION as (
+    Select * from ER_TEMP_OOSREDISTRIBUTION_20240724 WHERE FC_COUNT = 7
+    UNION ALL 
+    Select
+        FC_COMBO,
+        CAST(FC_COUNT as int) as FC_COUNT,
+        OOS_FC,
+        COVERAGE_FC,
+        COVERAGE_PERCENT,
+        current_date() as DATE_MODIFIED
+    from SPREETAIL_WAREHOUSE.INVENTORY.OOS_REALLOCATION OOS
+)
+
+, FIFOCOST as (
+        Select Fifo.* from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE Fifo
+        INNER JOIN (Select ITEMID, max(DM_UPDATEDON) as MaxDate from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE GROUP BY ITEMID) as MaxDate on MaxDate.MaxDate = Fifo.DM_UPDATEDON AND MaxDate.ITEMID = Fifo.ITEMID
+        --Where ITEMID = 243726
+)
+
+, NonIBOpt as (
+        Select 
+            sim.ITEMID,
+            sim.SUPPLIERID,
+            sim.FC,
+            sim.FC as FC_CODE,
+            sim.ORDERTYPE,
+            sim.OTF,
+            sim.LT,
+            sim.CAP_DOS,
+            sim.ITERATION_COUNT,
+            sim.RFP_ITERATION_COUNT,
+            sim.CAP_ORDERQTY_USED as Output_Original,
+            FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OriginalCost,
+            0 as FC_Limited,
+            0 as Redistribution_Qty,
+            sim.CAP_ORDERQTY_USED as Output_Redistributed,
+            FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_RedistributedCost,
+            sim.CASEQUANTITY,
+            prod.ITEMCUBE,
+            FIFOCOST.FIFOAVERAGECOST,
+            0 as Item_Constraint_Used,
+            NULL as Item_MOQMOV_Type,
+            0 as Redistribution_Qty_ItemMOQ,
+            0 as Constraint_Total_Applicable,
+            0 as Roundup_ItemMOQ,
+            sim.CAP_ORDERQTY_USED as Output_OrderQty_ItemMOQ,
+            FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OrderCost_ItemMOQ,
+            'Round' as Case_RoundType,
+            (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundQty,
+            FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundCost,
+            NULL as Item_Pallet_Type,
+            1 as Item_Pallet_Constraint,
+            0 as Item_Pallet_TotalRound,
+            (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletQty,
+            FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletCost,
+            'None' as Brand_MOV_Type,
+            0 as Brand_MOV_Used,
+            0 as MOV_RoundUnits,
+            0 as MOV_ReqRoundAdd_Pallet,
+            (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVQty,
+            FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVCost,
+            sim."Last Modified"
+        from inventorysandbox.dbo.RFP_ordering_sim sim
+        LEFT JOIN inventorysandbox.dbo.RFP_IB_optimization IBOpt on IBOpt.itemid = sim.itemid AND IBOpt.fc = sim.fc AND 
+            IBOpt.rfp_iteration_count = sim.rfp_iteration_count AND IBOPT.ordertype = sim.ordertype AND IBOPT.otf = sim.otf AND IBOPT.lt = sim.lt
+        LEFT JOIN FIFOCOST on FIFOCOST.itemid = sim.itemid
+        LEFT JOIN lakehouse.spreedw_dim.product prod on prod.itemid = sim.itemid
+        INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = sim.rfp_iteration_count
+        WHERE IBOpt.ITEMID IS NULL
+)
+
+, IBOPTSETUP as (
+        Select Opt.* from inventorysandbox.dbo.RFP_IB_optimization Opt INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = Opt.rfp_iteration_count
+        UNION
+        Select * from NonIBOpt
+)
+
+, Step1 as (
+        Select 
+            valid.SUPPLIERID,
+            CASE WHEN valid.ORDERTYPE = 'Domestic' THEN 'domestic' WHEN valid.ORDERTYPE = 'Import' THEN 'import' ELSE valid.ORDERTYPE END as ORDERTYPE,
+            valid.OTF,
+            valid.LT,
+            valid.CAP_DOS,
+            valid.iteration_count,
+            valid.RFP_ITERATION_COUNT,
+            'None' as Brand_CubeWeightUnit_Type,
+            null as BrandCube_Target,
+            CASE WHEN SUM(GA_Qty.GAQty) > 0 THEN 'GA ' ELSE '' END || CASE WHEN SUM(IN_Qty.INQty) > 0 THEN 'IN ' ELSE '' END || CASE WHEN SUM(NE_Qty.NEQty) > 0 THEN 'NE ' ELSE '' END || CASE WHEN SUM(NV_Qty.NVQty) > 0 THEN 'NV ' ELSE '' END
+            || CASE WHEN SUM(PA_Qty.PAQty) > 0 THEN 'PA ' ELSE '' END || CASE WHEN SUM(TX_Qty.TXQty) > 0 THEN 'TX ' ELSE '' END || CASE WHEN SUM(WA_Qty.WAQty) > 0 THEN 'WA ' ELSE '' END as FC_COMBO_ORDERED,
+            CASE WHEN SUM(GA_Qty.GAQty) > 0 THEN 1 ELSE 0 END + CASE WHEN SUM(IN_Qty.INQty) > 0 THEN 1 ELSE 0 END + CASE WHEN SUM(NE_Qty.NEQty) > 0 THEN 1 ELSE 0 END + CASE WHEN SUM(NV_Qty.NVQty) > 0 THEN 1 ELSE 0 END + 
+                CASE WHEN SUM(PA_Qty.PAQty) > 0 THEN 1 ELSE 0 END + CASE WHEN SUM(TX_Qty.TXQty) > 0 THEN 1 ELSE 0 END + CASE WHEN SUM(WA_Qty.WAQty) > 0 THEN 1 ELSE 0 END as FC_COUNT,
+            MAX(GREATEST(0, WA_Qty.WAQty)) as WAQty, MAX(GREATEST(0, WA_Qty.WACube)) as WACube, MAX(GREATEST(0, WA_Qty.WAWeight)) as WAWeight,
+            MAX(GREATEST(0, NV_Qty.NVQty)) as NVQty, MAX(GREATEST(0, NV_Qty.NVCube)) as NVCube, MAX(GREATEST(0, NV_Qty.NVWeight)) as NVWeight,
+            MAX(GREATEST(0, NE_Qty.NEQty)) as NEQty, MAX(GREATEST(0, NE_Qty.NECube)) as NECube, MAX(GREATEST(0, NE_Qty.NEWeight)) as NEWeight,
+            MAX(GREATEST(0, TX_Qty.TXQty)) as TXQty, MAX(GREATEST(0, TX_Qty.TXCube)) as TXCube, MAX(GREATEST(0, TX_Qty.TXWeight)) as TXWeight,
+            MAX(GREATEST(0, IN_Qty.INQty)) as INQty, MAX(GREATEST(0, IN_Qty.INCube)) as INCube, MAX(GREATEST(0, IN_Qty.INWeight)) as INWeight,
+            MAX(GREATEST(0, PA_Qty.PAQty)) as PAQty, MAX(GREATEST(0, PA_Qty.PACube)) as PACube, MAX(GREATEST(0, PA_Qty.PAWeight)) as PAWeight,
+            MAX(GREATEST(0, GA_Qty.GAQty)) as GAQty, MAX(GREATEST(0, GA_Qty.GACube)) as GACube, MAX(GREATEST(0, GA_Qty.GAWeight)) as GAWeight,
+            CASE WHEN MAX(GREATEST(0, WA_Qty.WAQty)) > 0 THEN 1 ELSE 0 END as WA_Ordered, CASE WHEN MAX(GREATEST(0, NV_Qty.NVQty)) > 0 THEN 1 ELSE 0 END as NV_Ordered,
+            CASE WHEN MAX(GREATEST(0, NE_Qty.NEQty)) > 0 THEN 1 ELSE 0 END as NE_Ordered, CASE WHEN MAX(GREATEST(0, TX_Qty.TXQty)) > 0 THEN 1 ELSE 0 END as TX_Ordered,
+            CASE WHEN MAX(GREATEST(0, IN_Qty.INQty)) > 0 THEN 1 ELSE 0 END as IN_Ordered, CASE WHEN MAX(GREATEST(0, PA_Qty.PAQty)) > 0 THEN 1 ELSE 0 END as PA_Ordered,
+            CASE WHEN MAX(GREATEST(0, GA_Qty.GAQty)) > 0 THEN 1 ELSE 0 END as GA_Ordered
+        FROM IBOPTSETUP valid
+        LEFT JOIN (SELECT "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS", SUM("Output_BrandMOVQty") WAQty, SUM("Output_BrandMOVQty" * ITEMCUBE) WACube, SUM("Output_BrandMOVQty")   
+            WAWeight FROM IBOPTSETUP Where "FC" = 'WA' GROUP BY "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS") WA_Qty 
+            on WA_Qty.SUPPLIERID = valid.SUPPLIERID AND WA_Qty.ORDERTYPE = valid.ORDERTYPE AND WA_Qty.OTF = valid.OTF AND WA_Qty.LT = valid.LT AND WA_Qty.CAP_DOS = valid.CAP_DOS
+        LEFT JOIN (SELECT "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS", SUM("Output_BrandMOVQty") NVQty, SUM("Output_BrandMOVQty" * ITEMCUBE) NVCube, SUM("Output_BrandMOVQty") 
+            NVWeight FROM IBOPTSETUP Where "FC" = 'NV' GROUP BY "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS") NV_Qty 
+            on NV_Qty.SUPPLIERID = valid.SUPPLIERID AND NV_Qty.ORDERTYPE = valid.ORDERTYPE AND NV_Qty.OTF = valid.OTF AND NV_Qty.LT = valid.LT AND NV_Qty.CAP_DOS = valid.CAP_DOS
+        LEFT JOIN (SELECT "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS", SUM("Output_BrandMOVQty") NEQty, SUM("Output_BrandMOVQty" * ITEMCUBE) NECube, SUM("Output_BrandMOVQty") 
+            NEWeight FROM IBOPTSETUP Where "FC" = 'NE' GROUP BY "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS") NE_Qty 
+            on NE_Qty.SUPPLIERID = valid.SUPPLIERID AND NE_Qty.ORDERTYPE = valid.ORDERTYPE AND NE_Qty.OTF = valid.OTF AND NE_Qty.LT = valid.LT AND NE_Qty.CAP_DOS = valid.CAP_DOS
+        LEFT JOIN (SELECT "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS", SUM("Output_BrandMOVQty") TXQty, SUM("Output_BrandMOVQty" * ITEMCUBE) TXCube, SUM("Output_BrandMOVQty") 
+            TXWeight FROM IBOPTSETUP Where "FC" = 'TX' GROUP BY "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS") TX_Qty 
+            on TX_Qty.SUPPLIERID = valid.SUPPLIERID AND TX_Qty.ORDERTYPE = valid.ORDERTYPE AND TX_Qty.OTF = valid.OTF AND TX_Qty.LT = valid.LT AND TX_Qty.CAP_DOS = valid.CAP_DOS
+        LEFT JOIN (SELECT "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS", SUM("Output_BrandMOVQty") INQty, SUM("Output_BrandMOVQty" * ITEMCUBE) INCube, SUM("Output_BrandMOVQty") 
+            INWeight FROM IBOPTSETUP Where "FC" = 'IN' GROUP BY "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS") IN_Qty 
+            on IN_Qty.SUPPLIERID = valid.SUPPLIERID AND IN_Qty.ORDERTYPE = valid.ORDERTYPE AND IN_Qty.OTF = valid.OTF AND IN_Qty.LT = valid.LT AND IN_Qty.CAP_DOS = valid.CAP_DOS
+        LEFT JOIN (SELECT "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS", SUM("Output_BrandMOVQty") PAQty, SUM("Output_BrandMOVQty" * ITEMCUBE) PACube, SUM("Output_BrandMOVQty") 
+            PAWeight FROM IBOPTSETUP Where "FC" = 'PA' GROUP BY "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS") PA_Qty 
+            on PA_Qty.SUPPLIERID = valid.SUPPLIERID AND PA_Qty.ORDERTYPE = valid.ORDERTYPE AND PA_Qty.OTF = valid.OTF AND PA_Qty.LT = valid.LT AND PA_Qty.CAP_DOS = valid.CAP_DOS
+        LEFT JOIN (SELECT "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS", SUM("Output_BrandMOVQty") GAQty, SUM("Output_BrandMOVQty" * ITEMCUBE) GACube, SUM("Output_BrandMOVQty") 
+            GAWeight FROM IBOPTSETUP Where "FC" = 'GA' GROUP BY "SUPPLIERID", "ORDERTYPE", "OTF", "LT", "CAP_DOS") GA_Qty 
+            on GA_Qty.SUPPLIERID = valid.SUPPLIERID AND GA_Qty.ORDERTYPE = valid.ORDERTYPE AND GA_Qty.OTF = valid.OTF AND GA_Qty.LT = valid.LT AND GA_Qty.CAP_DOS = valid.CAP_DOS
+        --Where valid.SUPPLIERID = 1438 --768
+        GROUP BY valid.SUPPLIERID, valid.ORDERTYPE, valid.OTF, valid.LT, valid.CAP_DOS, valid.iteration_count, valid.RFP_ITERATION_COUNT
+        )
+        
+        Select 
+            Step1.*,
+            Redist.FC_COMBO as FC_COMBO_OPTION,
+            Redist.FC_COUNT as FC_COUNT_OPTION,
+            CASE WHEN FC_COUNT_OPTION = 7 THEN 'WA' ELSE IFNULL(WA_Cover.COVERAGE_FC, 'WA') END as WA_CoverFC,
+            CASE WHEN FC_COUNT_OPTION = 7 THEN 'NV' ELSE IFNULL(NV_Cover.COVERAGE_FC, 'NV') END as NV_CoverFC,
+            CASE WHEN FC_COUNT_OPTION = 7 THEN 'NE' ELSE IFNULL(NE_Cover.COVERAGE_FC, 'NE') END as NE_CoverFC,
+            CASE WHEN FC_COUNT_OPTION = 7 THEN 'TX' ELSE IFNULL(TX_Cover.COVERAGE_FC, 'TX') END as TX_CoverFC,
+            CASE WHEN FC_COUNT_OPTION = 7 THEN 'IN' ELSE IFNULL(IN_Cover.COVERAGE_FC, 'IN') END as IN_CoverFC,
+            CASE WHEN FC_COUNT_OPTION = 7 THEN 'PA' ELSE IFNULL(PA_Cover.COVERAGE_FC, 'PA') END as PA_CoverFC,
+            CASE WHEN FC_COUNT_OPTION = 7 THEN 'GA' ELSE IFNULL(GA_Cover.COVERAGE_FC, 'GA') END as GA_CoverFC
+        from Step1
+        LEFT JOIN (Select DISTINCT FC_COMBO, FC_COUNT, CASE WHEN CHARINDEX('WA', FC_COMBO) > 0 THEN 1 ELSE 0 END as WA_Ordered,
+            CASE WHEN CHARINDEX('NV', FC_COMBO) > 0 THEN 1 ELSE 0 END as NV_Ordered, CASE WHEN CHARINDEX('NE', FC_COMBO) > 0 THEN 1 ELSE 0 END as NE_Ordered,
+            CASE WHEN CHARINDEX('TX', FC_COMBO) > 0 THEN 1 ELSE 0 END as TX_Ordered, CASE WHEN CHARINDEX('IN', FC_COMBO) > 0 THEN 1 ELSE 0 END as IN_Ordered,
+            CASE WHEN CHARINDEX('PA', FC_COMBO) > 0 THEN 1 ELSE 0 END as PA_Ordered, CASE WHEN CHARINDEX('GA', FC_COMBO) > 0 THEN 1 ELSE 0 END as GA_Ordered
+            from OOSREDISTRIBUTION) Redist on Redist.WA_Ordered <= Step1.WA_Ordered AND Redist.NV_Ordered <= Step1.NV_Ordered AND Redist.NE_Ordered <= Step1.NE_Ordered AND Redist.TX_Ordered <= Step1.TX_Ordered AND Redist.IN_Ordered <= Step1.IN_Ordered AND Redist.PA_Ordered <= Step1.PA_Ordered AND Redist.GA_Ordered <= Step1.GA_Ordered
+        
+        LEFT JOIN (Select DISTINCT FC_COMBO, COVERAGE_PERCENT, OOS_FC, COVERAGE_FC, DENSE_RANK() OVER (PARTITION BY FC_COMBO, OOS_FC ORDER BY COVERAGE_PERCENT DESC) as CoverageRank from OOSREDISTRIBUTION) WA_Cover on WA_Cover.FC_COMBO = Redist.FC_COMBO AND WA_Cover.CoverageRank = 1 AND WA_Cover.OOS_FC = 'WA'
+        LEFT JOIN (Select DISTINCT FC_COMBO, COVERAGE_PERCENT, OOS_FC, COVERAGE_FC, DENSE_RANK() OVER (PARTITION BY FC_COMBO, OOS_FC ORDER BY COVERAGE_PERCENT DESC) as CoverageRank from OOSREDISTRIBUTION) NV_Cover on NV_Cover.FC_COMBO = Redist.FC_COMBO AND NV_Cover.CoverageRank = 1 AND NV_Cover.OOS_FC = 'NV'
+        LEFT JOIN (Select DISTINCT FC_COMBO, COVERAGE_PERCENT, OOS_FC, COVERAGE_FC, DENSE_RANK() OVER (PARTITION BY FC_COMBO, OOS_FC ORDER BY COVERAGE_PERCENT DESC) as CoverageRank from OOSREDISTRIBUTION) NE_Cover on NE_Cover.FC_COMBO = Redist.FC_COMBO AND NE_Cover.CoverageRank = 1 AND NE_Cover.OOS_FC = 'NE'
+        LEFT JOIN (Select DISTINCT FC_COMBO, COVERAGE_PERCENT, OOS_FC, COVERAGE_FC, DENSE_RANK() OVER (PARTITION BY FC_COMBO, OOS_FC ORDER BY COVERAGE_PERCENT DESC) as CoverageRank from OOSREDISTRIBUTION) TX_Cover on TX_Cover.FC_COMBO = Redist.FC_COMBO AND TX_Cover.CoverageRank = 1 AND TX_Cover.OOS_FC = 'TX'
+        LEFT JOIN (Select DISTINCT FC_COMBO, COVERAGE_PERCENT, OOS_FC, COVERAGE_FC, DENSE_RANK() OVER (PARTITION BY FC_COMBO, OOS_FC ORDER BY COVERAGE_PERCENT DESC) as CoverageRank from OOSREDISTRIBUTION) IN_Cover on IN_Cover.FC_COMBO = Redist.FC_COMBO AND IN_Cover.CoverageRank = 1 AND IN_Cover.OOS_FC = 'IN'
+        LEFT JOIN (Select DISTINCT FC_COMBO, COVERAGE_PERCENT, OOS_FC, COVERAGE_FC, DENSE_RANK() OVER (PARTITION BY FC_COMBO, OOS_FC ORDER BY COVERAGE_PERCENT DESC) as CoverageRank from OOSREDISTRIBUTION) PA_Cover on PA_Cover.FC_COMBO = Redist.FC_COMBO AND PA_Cover.CoverageRank = 1 AND PA_Cover.OOS_FC = 'PA'
+        LEFT JOIN (Select DISTINCT FC_COMBO, COVERAGE_PERCENT, OOS_FC, COVERAGE_FC, DENSE_RANK() OVER (PARTITION BY FC_COMBO, OOS_FC ORDER BY COVERAGE_PERCENT DESC) as CoverageRank from OOSREDISTRIBUTION) GA_Cover on GA_Cover.FC_COMBO = Redist.FC_COMBO AND GA_Cover.CoverageRank = 1 AND GA_Cover.OOS_FC = 'GA'
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) MaxCount
+        WHERE MAX_COUNT = Step1.RFP_ITERATION_COUNT
+        --AND Step1.SUPPLIERID = 1787
+        --AND FC_COMBO_OPTION = 'GA IN NE NV PA TX WA'
+                   """
+    df_InputData = session.sql(InputData)
+    df_InputData = df_InputData.to_pandas()
+        #Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter(col("SUPPLIERID") == '1688');
+    
+#Create Qty, Cube, Weight Adjustments per FC Combo
+    df_InputData['WA_Qty_Coverage'] = np.where(df_InputData['WA_COVERFC'] != 'WA', -df_InputData['WAQTY'], 0) + np.where(df_InputData['NV_COVERFC'] == 'WA', df_InputData['NVQTY'], 0) + np.where(df_InputData['NE_COVERFC'] == 'WA', df_InputData['NEQTY'], 0) + np.where(df_InputData['TX_COVERFC'] == 'WA', df_InputData['TXQTY'], 0) + np.where(df_InputData['IN_COVERFC'] == 'WA', df_InputData['INQTY'], 0) + np.where(df_InputData['PA_COVERFC'] == 'WA', df_InputData['PAQTY'], 0) + np.where(df_InputData['GA_COVERFC'] == 'WA', df_InputData['GAQTY'], 0) 
+    df_InputData['NV_Qty_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'NV', df_InputData['WAQTY'], 0) + np.where(df_InputData['NV_COVERFC'] != 'NV', -df_InputData['NVQTY'], 0) + np.where(df_InputData['NE_COVERFC'] == 'NV', df_InputData['NEQTY'], 0) + np.where(df_InputData['TX_COVERFC'] == 'NV', df_InputData['TXQTY'], 0) + np.where(df_InputData['IN_COVERFC'] == 'NV', df_InputData['INQTY'], 0) + np.where(df_InputData['PA_COVERFC'] == 'NV', df_InputData['PAQTY'], 0) + np.where(df_InputData['GA_COVERFC'] == 'NV', df_InputData['GAQTY'], 0) 
+    df_InputData['NE_Qty_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'NE', df_InputData['WAQTY'], 0) + np.where(df_InputData['NV_COVERFC'] == 'NE', df_InputData['NVQTY'], 0) + np.where(df_InputData['NE_COVERFC'] != 'NE', -df_InputData['NEQTY'], 0) + np.where(df_InputData['TX_COVERFC'] == 'NE', df_InputData['TXQTY'], 0) + np.where(df_InputData['IN_COVERFC'] == 'NE', df_InputData['INQTY'], 0) + np.where(df_InputData['PA_COVERFC'] == 'NE', df_InputData['PAQTY'], 0) + np.where(df_InputData['GA_COVERFC'] == 'NE', df_InputData['GAQTY'], 0) 
+    df_InputData['TX_Qty_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'TX', df_InputData['WAQTY'], 0) + np.where(df_InputData['NV_COVERFC'] == 'TX', df_InputData['NVQTY'], 0) + np.where(df_InputData['NE_COVERFC'] == 'TX', df_InputData['NEQTY'], 0) + np.where(df_InputData['TX_COVERFC'] != 'TX', -df_InputData['TXQTY'], 0) + np.where(df_InputData['IN_COVERFC'] == 'TX', df_InputData['INQTY'], 0) + np.where(df_InputData['PA_COVERFC'] == 'TX', df_InputData['PAQTY'], 0) + np.where(df_InputData['GA_COVERFC'] == 'TX', df_InputData['GAQTY'], 0) 
+    df_InputData['IN_Qty_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'IN', df_InputData['WAQTY'], 0) + np.where(df_InputData['NV_COVERFC'] == 'IN', df_InputData['NVQTY'], 0) + np.where(df_InputData['NE_COVERFC'] == 'IN', df_InputData['NEQTY'], 0) + np.where(df_InputData['TX_COVERFC'] == 'IN', df_InputData['TXQTY'], 0) + np.where(df_InputData['IN_COVERFC'] != 'IN', -df_InputData['INQTY'], 0) + np.where(df_InputData['PA_COVERFC'] == 'IN', df_InputData['PAQTY'], 0) + np.where(df_InputData['GA_COVERFC'] == 'IN', df_InputData['GAQTY'], 0) 
+    df_InputData['PA_Qty_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'PA', df_InputData['WAQTY'], 0) + np.where(df_InputData['NV_COVERFC'] == 'PA', df_InputData['NVQTY'], 0) + np.where(df_InputData['NE_COVERFC'] == 'PA', df_InputData['NEQTY'], 0) + np.where(df_InputData['TX_COVERFC'] == 'PA', df_InputData['TXQTY'], 0) + np.where(df_InputData['IN_COVERFC'] == 'PA', df_InputData['INQTY'], 0) + np.where(df_InputData['PA_COVERFC'] != 'PA', -df_InputData['PAQTY'], 0) + np.where(df_InputData['GA_COVERFC'] == 'PA', df_InputData['GAQTY'], 0) 
+    df_InputData['GA_Qty_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'GA', df_InputData['WAQTY'], 0) + np.where(df_InputData['NV_COVERFC'] == 'GA', df_InputData['NVQTY'], 0) + np.where(df_InputData['NE_COVERFC'] == 'GA', df_InputData['NEQTY'], 0) + np.where(df_InputData['TX_COVERFC'] == 'GA', df_InputData['TXQTY'], 0) + np.where(df_InputData['IN_COVERFC'] == 'GA', df_InputData['INQTY'], 0) + np.where(df_InputData['PA_COVERFC'] == 'GA', df_InputData['PAQTY'], 0) + np.where(df_InputData['GA_COVERFC'] != 'GA', -df_InputData['GAQTY'], 0) 
+    
+    df_InputData['WA_CUBE_Coverage'] = np.where(df_InputData['WA_COVERFC'] != 'WA', -df_InputData['WACUBE'], 0) + np.where(df_InputData['NV_COVERFC'] == 'WA', df_InputData['NVCUBE'], 0) + np.where(df_InputData['NE_COVERFC'] == 'WA', df_InputData['NECUBE'], 0) + np.where(df_InputData['TX_COVERFC'] == 'WA', df_InputData['TXCUBE'], 0) + np.where(df_InputData['IN_COVERFC'] == 'WA', df_InputData['INCUBE'], 0) + np.where(df_InputData['PA_COVERFC'] == 'WA', df_InputData['PACUBE'], 0) + np.where(df_InputData['GA_COVERFC'] == 'WA', df_InputData['GACUBE'], 0) 
+    df_InputData['NV_CUBE_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'NV', df_InputData['WACUBE'], 0) + np.where(df_InputData['NV_COVERFC'] != 'NV', -df_InputData['NVCUBE'], 0) + np.where(df_InputData['NE_COVERFC'] == 'NV', df_InputData['NECUBE'], 0) + np.where(df_InputData['TX_COVERFC'] == 'NV', df_InputData['TXCUBE'], 0) + np.where(df_InputData['IN_COVERFC'] == 'NV', df_InputData['INCUBE'], 0) + np.where(df_InputData['PA_COVERFC'] == 'NV', df_InputData['PACUBE'], 0) + np.where(df_InputData['GA_COVERFC'] == 'NV', df_InputData['GACUBE'], 0) 
+    df_InputData['NE_CUBE_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'NE', df_InputData['WACUBE'], 0) + np.where(df_InputData['NV_COVERFC'] == 'NE', df_InputData['NVCUBE'], 0) + np.where(df_InputData['NE_COVERFC'] != 'NE', -df_InputData['NECUBE'], 0) + np.where(df_InputData['TX_COVERFC'] == 'NE', df_InputData['TXCUBE'], 0) + np.where(df_InputData['IN_COVERFC'] == 'NE', df_InputData['INCUBE'], 0) + np.where(df_InputData['PA_COVERFC'] == 'NE', df_InputData['PACUBE'], 0) + np.where(df_InputData['GA_COVERFC'] == 'NE', df_InputData['GACUBE'], 0) 
+    df_InputData['TX_CUBE_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'TX', df_InputData['WACUBE'], 0) + np.where(df_InputData['NV_COVERFC'] == 'TX', df_InputData['NVCUBE'], 0) + np.where(df_InputData['NE_COVERFC'] == 'TX', df_InputData['NECUBE'], 0) + np.where(df_InputData['TX_COVERFC'] != 'TX', -df_InputData['TXCUBE'], 0) + np.where(df_InputData['IN_COVERFC'] == 'TX', df_InputData['INCUBE'], 0) + np.where(df_InputData['PA_COVERFC'] == 'TX', df_InputData['PACUBE'], 0) + np.where(df_InputData['GA_COVERFC'] == 'TX', df_InputData['GACUBE'], 0) 
+    df_InputData['IN_CUBE_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'IN', df_InputData['WACUBE'], 0) + np.where(df_InputData['NV_COVERFC'] == 'IN', df_InputData['NVCUBE'], 0) + np.where(df_InputData['NE_COVERFC'] == 'IN', df_InputData['NECUBE'], 0) + np.where(df_InputData['TX_COVERFC'] == 'IN', df_InputData['TXCUBE'], 0) + np.where(df_InputData['IN_COVERFC'] != 'IN', -df_InputData['INCUBE'], 0) + np.where(df_InputData['PA_COVERFC'] == 'IN', df_InputData['PACUBE'], 0) + np.where(df_InputData['GA_COVERFC'] == 'IN', df_InputData['GACUBE'], 0) 
+    df_InputData['PA_CUBE_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'PA', df_InputData['WACUBE'], 0) + np.where(df_InputData['NV_COVERFC'] == 'PA', df_InputData['NVCUBE'], 0) + np.where(df_InputData['NE_COVERFC'] == 'PA', df_InputData['NECUBE'], 0) + np.where(df_InputData['TX_COVERFC'] == 'PA', df_InputData['TXCUBE'], 0) + np.where(df_InputData['IN_COVERFC'] == 'PA', df_InputData['INCUBE'], 0) + np.where(df_InputData['PA_COVERFC'] != 'PA', -df_InputData['PACUBE'], 0) + np.where(df_InputData['GA_COVERFC'] == 'PA', df_InputData['GACUBE'], 0) 
+    df_InputData['GA_CUBE_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'GA', df_InputData['WACUBE'], 0) + np.where(df_InputData['NV_COVERFC'] == 'GA', df_InputData['NVCUBE'], 0) + np.where(df_InputData['NE_COVERFC'] == 'GA', df_InputData['NECUBE'], 0) + np.where(df_InputData['TX_COVERFC'] == 'GA', df_InputData['TXCUBE'], 0) + np.where(df_InputData['IN_COVERFC'] == 'GA', df_InputData['INCUBE'], 0) + np.where(df_InputData['PA_COVERFC'] == 'GA', df_InputData['PACUBE'], 0) + np.where(df_InputData['GA_COVERFC'] != 'GA', -df_InputData['GACUBE'], 0)
+    
+    df_InputData['WA_WEIGHT_Coverage'] = np.where(df_InputData['WA_COVERFC'] != 'WA', -df_InputData['WAWEIGHT'], 0) + np.where(df_InputData['NV_COVERFC'] == 'WA', df_InputData['NVWEIGHT'], 0) + np.where(df_InputData['NE_COVERFC'] == 'WA', df_InputData['NEWEIGHT'], 0) + np.where(df_InputData['TX_COVERFC'] == 'WA', df_InputData['TXWEIGHT'], 0) + np.where(df_InputData['IN_COVERFC'] == 'WA', df_InputData['INWEIGHT'], 0) + np.where(df_InputData['PA_COVERFC'] == 'WA', df_InputData['PAWEIGHT'], 0) + np.where(df_InputData['GA_COVERFC'] == 'WA', df_InputData['GAWEIGHT'], 0) 
+    df_InputData['NV_WEIGHT_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'NV', df_InputData['WAWEIGHT'], 0) + np.where(df_InputData['NV_COVERFC'] != 'NV', -df_InputData['NVWEIGHT'], 0) + np.where(df_InputData['NE_COVERFC'] == 'NV', df_InputData['NEWEIGHT'], 0) + np.where(df_InputData['TX_COVERFC'] == 'NV', df_InputData['TXWEIGHT'], 0) + np.where(df_InputData['IN_COVERFC'] == 'NV', df_InputData['INWEIGHT'], 0) + np.where(df_InputData['PA_COVERFC'] == 'NV', df_InputData['PAWEIGHT'], 0) + np.where(df_InputData['GA_COVERFC'] == 'NV', df_InputData['GAWEIGHT'], 0) 
+    df_InputData['NE_WEIGHT_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'NE', df_InputData['WAWEIGHT'], 0) + np.where(df_InputData['NV_COVERFC'] == 'NE', df_InputData['NVWEIGHT'], 0) + np.where(df_InputData['NE_COVERFC'] != 'NE', -df_InputData['NEWEIGHT'], 0) + np.where(df_InputData['TX_COVERFC'] == 'NE', df_InputData['TXWEIGHT'], 0) + np.where(df_InputData['IN_COVERFC'] == 'NE', df_InputData['INWEIGHT'], 0) + np.where(df_InputData['PA_COVERFC'] == 'NE', df_InputData['PAWEIGHT'], 0) + np.where(df_InputData['GA_COVERFC'] == 'NE', df_InputData['GAWEIGHT'], 0) 
+    df_InputData['TX_WEIGHT_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'TX', df_InputData['WAWEIGHT'], 0) + np.where(df_InputData['NV_COVERFC'] == 'TX', df_InputData['NVWEIGHT'], 0) + np.where(df_InputData['NE_COVERFC'] == 'TX', df_InputData['NEWEIGHT'], 0) + np.where(df_InputData['TX_COVERFC'] != 'TX', -df_InputData['TXWEIGHT'], 0) + np.where(df_InputData['IN_COVERFC'] == 'TX', df_InputData['INWEIGHT'], 0) + np.where(df_InputData['PA_COVERFC'] == 'TX', df_InputData['PAWEIGHT'], 0) + np.where(df_InputData['GA_COVERFC'] == 'TX', df_InputData['GAWEIGHT'], 0) 
+    df_InputData['IN_WEIGHT_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'IN', df_InputData['WAWEIGHT'], 0) + np.where(df_InputData['NV_COVERFC'] == 'IN', df_InputData['NVWEIGHT'], 0) + np.where(df_InputData['NE_COVERFC'] == 'IN', df_InputData['NEWEIGHT'], 0) + np.where(df_InputData['TX_COVERFC'] == 'IN', df_InputData['TXWEIGHT'], 0) + np.where(df_InputData['IN_COVERFC'] != 'IN', -df_InputData['INWEIGHT'], 0) + np.where(df_InputData['PA_COVERFC'] == 'IN', df_InputData['PAWEIGHT'], 0) + np.where(df_InputData['GA_COVERFC'] == 'IN', df_InputData['GAWEIGHT'], 0) 
+    df_InputData['PA_WEIGHT_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'PA', df_InputData['WAWEIGHT'], 0) + np.where(df_InputData['NV_COVERFC'] == 'PA', df_InputData['NVWEIGHT'], 0) + np.where(df_InputData['NE_COVERFC'] == 'PA', df_InputData['NEWEIGHT'], 0) + np.where(df_InputData['TX_COVERFC'] == 'PA', df_InputData['TXWEIGHT'], 0) + np.where(df_InputData['IN_COVERFC'] == 'PA', df_InputData['INWEIGHT'], 0) + np.where(df_InputData['PA_COVERFC'] != 'PA', -df_InputData['PAWEIGHT'], 0) + np.where(df_InputData['GA_COVERFC'] == 'PA', df_InputData['GAWEIGHT'], 0) 
+    df_InputData['GA_WEIGHT_Coverage'] = np.where(df_InputData['WA_COVERFC'] == 'GA', df_InputData['WAWEIGHT'], 0) + np.where(df_InputData['NV_COVERFC'] == 'GA', df_InputData['NVWEIGHT'], 0) + np.where(df_InputData['NE_COVERFC'] == 'GA', df_InputData['NEWEIGHT'], 0) + np.where(df_InputData['TX_COVERFC'] == 'GA', df_InputData['TXWEIGHT'], 0) + np.where(df_InputData['IN_COVERFC'] == 'GA', df_InputData['INWEIGHT'], 0) + np.where(df_InputData['PA_COVERFC'] == 'GA', df_InputData['PAWEIGHT'], 0) + np.where(df_InputData['GA_COVERFC'] != 'GA', -df_InputData['GAWEIGHT'], 0)
+    
+#Generate Updated Qty, Cube and Weight Totals - remove adjustment columns
+    df_InputData['WAQTY_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['WAQTY'], df_InputData['WA_Qty_Coverage'] + df_InputData['WAQTY'])
+    df_InputData['NVQTY_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['NVQTY'], df_InputData['NV_Qty_Coverage'] + df_InputData['NVQTY'])
+    df_InputData['NEQTY_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['NEQTY'], df_InputData['NE_Qty_Coverage'] + df_InputData['NEQTY'])
+    df_InputData['TXQTY_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['TXQTY'], df_InputData['TX_Qty_Coverage'] + df_InputData['TXQTY'])
+    df_InputData['INQTY_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['INQTY'], df_InputData['IN_Qty_Coverage'] + df_InputData['INQTY'])
+    df_InputData['PAQTY_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['PAQTY'], df_InputData['PA_Qty_Coverage'] + df_InputData['PAQTY'])
+    df_InputData['GAQTY_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['GAQTY'], df_InputData['GA_Qty_Coverage'] + df_InputData['GAQTY'])
+
+    df_InputData['WACUBE_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['WACUBE'], df_InputData['WA_CUBE_Coverage'] + df_InputData['WACUBE'])
+    df_InputData['NVCUBE_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['NVCUBE'], df_InputData['NV_CUBE_Coverage'] + df_InputData['NVCUBE'])
+    df_InputData['NECUBE_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['NECUBE'], df_InputData['NE_CUBE_Coverage'] + df_InputData['NECUBE'])
+    df_InputData['TXCUBE_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['TXCUBE'], df_InputData['TX_CUBE_Coverage'] + df_InputData['TXCUBE'])
+    df_InputData['INCUBE_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['INCUBE'], df_InputData['IN_CUBE_Coverage'] + df_InputData['INCUBE'])
+    df_InputData['PACUBE_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['PACUBE'], df_InputData['PA_CUBE_Coverage'] + df_InputData['PACUBE'])
+    df_InputData['GACUBE_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['GACUBE'], df_InputData['GA_CUBE_Coverage'] + df_InputData['GACUBE'])
+
+    df_InputData['WAWEIGHT_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['WAWEIGHT'], df_InputData['WA_WEIGHT_Coverage'] + df_InputData['WAWEIGHT'])
+    df_InputData['NVWEIGHT_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['NVWEIGHT'], df_InputData['NV_WEIGHT_Coverage'] + df_InputData['NVWEIGHT'])
+    df_InputData['NEWEIGHT_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['NEWEIGHT'], df_InputData['NE_WEIGHT_Coverage'] + df_InputData['NEWEIGHT'])
+    df_InputData['TXWEIGHT_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['TXWEIGHT'], df_InputData['TX_WEIGHT_Coverage'] + df_InputData['TXWEIGHT'])
+    df_InputData['INWEIGHT_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['INWEIGHT'], df_InputData['IN_WEIGHT_Coverage'] + df_InputData['INWEIGHT'])
+    df_InputData['PAWEIGHT_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['PAWEIGHT'], df_InputData['PA_WEIGHT_Coverage'] + df_InputData['PAWEIGHT'])
+    df_InputData['GAWEIGHT_OPTION'] = np.where(df_InputData['FC_COUNT_OPTION'] == 7, df_InputData['GAWEIGHT'], df_InputData['GA_WEIGHT_Coverage'] + df_InputData['GAWEIGHT'])
+
+    df_InputData['BRAND_CUBEWEIGHTUNIT_TYPE'] = 'Calculate Cube'
+    
+    df_InputData['TOTAL_CUBE_NETWORK'] = df_InputData['WACUBE_OPTION'] + df_InputData['NVCUBE_OPTION'] + df_InputData['NECUBE_OPTION'] + df_InputData['TXCUBE_OPTION'] + df_InputData['INCUBE_OPTION'] + df_InputData['PACUBE_OPTION']+ df_InputData['GACUBE_OPTION']
+    
+#May Not Be Needed
+    df_InputData['BRANDCUBE_TARGET'] = np.where(df_InputData['BRAND_CUBEWEIGHTUNIT_TYPE'] == 'Calculate Cube',
+                                                np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['TOTAL_CUBE_NETWORK'] < 1350), 1350, 
+                                                         np.where(df_InputData['ORDERTYPE'] == 'import', 2250,
+                                                                  np.where(df_InputData['TOTAL_CUBE_NETWORK'] < 100, 99,
+                                                                           np.where(df_InputData['TOTAL_CUBE_NETWORK'] < 600, 100,
+                                                                                    np.where(df_InputData['TOTAL_CUBE_NETWORK'] < 1600, 1600, 2450))))), 0)
+
+
+#Calculate Freight Type Count
+    def mround(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.round(x / base)
+
+    def roundup(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.ceil(x / base)
+
+    def rounddown(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.ceil(x / base)
+
+        #40ft Container & FTL    
+    df_InputData['WA_FTL_or_40ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['WACUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)), 0, df_InputData['WACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NV_FTL_or_40ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['NVCUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)), 0, df_InputData['NVCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NE_FTL_or_40ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['NECUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)), 0, df_InputData['NECUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['TX_FTL_or_40ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['TXCUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)), 0, df_InputData['TXCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['IN_FTL_or_40ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['INCUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)), 0, df_InputData['INCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['PA_FTL_or_40ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['PACUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)), 0, df_InputData['PACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['GA_FTL_or_40ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['GACUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)), 0, df_InputData['GACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    
+    df_InputData['WA_FTL_or_40ft_Count'] = np.where((np.abs(df_InputData.apply(lambda row: mround(row['WA_FTL_or_40ft_Count'], 1), axis=1)- df_InputData['WA_FTL_or_40ft_Count']) < 0.05) | (df_InputData['WACUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)),
+                                                    df_InputData.apply(lambda row: mround(row['WA_FTL_or_40ft_Count'], 1), axis=1), df_InputData.apply(lambda row: roundup(row['WA_FTL_or_40ft_Count'], 1), axis=1))
+    df_InputData['NV_FTL_or_40ft_Count'] = np.where((np.abs(df_InputData.apply(lambda row: mround(row['NV_FTL_or_40ft_Count'], 1), axis=1)- df_InputData['NV_FTL_or_40ft_Count']) < 0.05) | (df_InputData['NVCUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)),
+                                                    df_InputData.apply(lambda row: mround(row['NV_FTL_or_40ft_Count'], 1), axis=1), df_InputData.apply(lambda row: roundup(row['NV_FTL_or_40ft_Count'], 1), axis=1))
+    df_InputData['NE_FTL_or_40ft_Count'] = np.where((np.abs(df_InputData.apply(lambda row: mround(row['NE_FTL_or_40ft_Count'], 1), axis=1)- df_InputData['NE_FTL_or_40ft_Count']) < 0.05) | (df_InputData['NECUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)),
+                                                    df_InputData.apply(lambda row: mround(row['NE_FTL_or_40ft_Count'], 1), axis=1), df_InputData.apply(lambda row: roundup(row['NE_FTL_or_40ft_Count'], 1), axis=1))
+    df_InputData['TX_FTL_or_40ft_Count'] = np.where((np.abs(df_InputData.apply(lambda row: mround(row['TX_FTL_or_40ft_Count'], 1), axis=1)- df_InputData['TX_FTL_or_40ft_Count']) < 0.05) | (df_InputData['TXCUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)),
+                                                    df_InputData.apply(lambda row: mround(row['TX_FTL_or_40ft_Count'], 1), axis=1), df_InputData.apply(lambda row: roundup(row['TX_FTL_or_40ft_Count'], 1), axis=1))
+    df_InputData['IN_FTL_or_40ft_Count'] = np.where((np.abs(df_InputData.apply(lambda row: mround(row['IN_FTL_or_40ft_Count'], 1), axis=1)- df_InputData['IN_FTL_or_40ft_Count']) < 0.05) | (df_InputData['INCUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)),
+                                                    df_InputData.apply(lambda row: mround(row['IN_FTL_or_40ft_Count'], 1), axis=1), df_InputData.apply(lambda row: roundup(row['IN_FTL_or_40ft_Count'], 1), axis=1))
+    df_InputData['PA_FTL_or_40ft_Count'] = np.where((np.abs(df_InputData.apply(lambda row: mround(row['PA_FTL_or_40ft_Count'], 1), axis=1)- df_InputData['PA_FTL_or_40ft_Count']) < 0.05) | (df_InputData['PACUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)),
+                                                    df_InputData.apply(lambda row: mround(row['PA_FTL_or_40ft_Count'], 1), axis=1), df_InputData.apply(lambda row: roundup(row['PA_FTL_or_40ft_Count'], 1), axis=1))
+    df_InputData['GA_FTL_or_40ft_Count'] = np.where((np.abs(df_InputData.apply(lambda row: mround(row['GA_FTL_or_40ft_Count'], 1), axis=1)- df_InputData['GA_FTL_or_40ft_Count']) < 0.05) | (df_InputData['GACUBE_OPTION'] < np.where(df_InputData['ORDERTYPE'] == 'domestic', 1700, 1080)),
+                                                    df_InputData.apply(lambda row: mround(row['GA_FTL_or_40ft_Count'], 1), axis=1), df_InputData.apply(lambda row: roundup(row['GA_FTL_or_40ft_Count'], 1), axis=1))
+
+    df_InputData['WA_CubeCovered'] = df_InputData['WA_FTL_or_40ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)
+    df_InputData['NV_CubeCovered'] = df_InputData['NV_FTL_or_40ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)
+    df_InputData['NE_CubeCovered'] = df_InputData['NE_FTL_or_40ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)
+    df_InputData['TX_CubeCovered'] = df_InputData['TX_FTL_or_40ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)
+    df_InputData['IN_CubeCovered'] = df_InputData['IN_FTL_or_40ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)
+    df_InputData['PA_CubeCovered'] = df_InputData['PA_FTL_or_40ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)
+    df_InputData['GA_CubeCovered'] = df_InputData['GA_FTL_or_40ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)
+    df_InputData['WA_40FTL_CubeCovered'] = np.where(df_InputData['WA_FTL_or_40ft_Count'] > 0, df_InputData['WACUBE_OPTION'], 0)
+    df_InputData['NV_40FTL_CubeCovered'] = np.where(df_InputData['NV_FTL_or_40ft_Count'] > 0, df_InputData['NVCUBE_OPTION'], 0)
+    df_InputData['NE_40FTL_CubeCovered'] = np.where(df_InputData['NE_FTL_or_40ft_Count'] > 0, df_InputData['NECUBE_OPTION'], 0)
+    df_InputData['TX_40FTL_CubeCovered'] = np.where(df_InputData['TX_FTL_or_40ft_Count'] > 0, df_InputData['TXCUBE_OPTION'], 0)
+    df_InputData['IN_40FTL_CubeCovered'] = np.where(df_InputData['IN_FTL_or_40ft_Count'] > 0, df_InputData['INCUBE_OPTION'], 0)
+    df_InputData['PA_40FTL_CubeCovered'] = np.where(df_InputData['PA_FTL_or_40ft_Count'] > 0, df_InputData['PACUBE_OPTION'], 0)
+    df_InputData['GA_40FTL_CubeCovered'] = np.where(df_InputData['GA_FTL_or_40ft_Count'] > 0, df_InputData['GACUBE_OPTION'], 0)
+
+        #20ft Container & PTL    
+    df_InputData['WA_PTL_or_20ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['WACUBE_OPTION'] < 1080) & (df_InputData['WACUBE_OPTION'] > 0), 1, np.where(df_InputData['WACUBE_OPTION'] <= df_InputData['WA_CubeCovered'], 0, (df_InputData['WACUBE_OPTION'] - df_InputData['WA_CubeCovered'])) / np.where(df_InputData['ORDERTYPE'] == 'import', 1080, 600))
+    df_InputData['NV_PTL_or_20ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['NVCUBE_OPTION'] < 1080) & (df_InputData['NVCUBE_OPTION'] > 0), 1, np.where(df_InputData['NVCUBE_OPTION'] <= df_InputData['NV_CubeCovered'], 0, (df_InputData['NVCUBE_OPTION'] - df_InputData['NV_CubeCovered'])) / np.where(df_InputData['ORDERTYPE'] == 'import', 1080, 600))
+    df_InputData['NE_PTL_or_20ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['NECUBE_OPTION'] < 1080) & (df_InputData['NECUBE_OPTION'] > 0), 1, np.where(df_InputData['NECUBE_OPTION'] <= df_InputData['NE_CubeCovered'], 0, (df_InputData['NECUBE_OPTION'] - df_InputData['NE_CubeCovered'])) / np.where(df_InputData['ORDERTYPE'] == 'import', 1080, 600))
+    df_InputData['TX_PTL_or_20ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['TXCUBE_OPTION'] < 1080) & (df_InputData['TXCUBE_OPTION'] > 0), 1, np.where(df_InputData['TXCUBE_OPTION'] <= df_InputData['TX_CubeCovered'], 0, (df_InputData['TXCUBE_OPTION'] - df_InputData['TX_CubeCovered'])) / np.where(df_InputData['ORDERTYPE'] == 'import', 1080, 600))
+    df_InputData['IN_PTL_or_20ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['INCUBE_OPTION'] < 1080) & (df_InputData['INCUBE_OPTION'] > 0), 1, np.where(df_InputData['INCUBE_OPTION'] <= df_InputData['IN_CubeCovered'], 0, (df_InputData['INCUBE_OPTION'] - df_InputData['IN_CubeCovered'])) / np.where(df_InputData['ORDERTYPE'] == 'import', 1080, 600))
+    df_InputData['PA_PTL_or_20ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['PACUBE_OPTION'] < 1080) & (df_InputData['PACUBE_OPTION'] > 0), 1, np.where(df_InputData['PACUBE_OPTION'] <= df_InputData['PA_CubeCovered'], 0, (df_InputData['PACUBE_OPTION'] - df_InputData['PA_CubeCovered'])) / np.where(df_InputData['ORDERTYPE'] == 'import', 1080, 600))
+    df_InputData['GA_PTL_or_20ft_Count']  = np.where((df_InputData['ORDERTYPE'] == 'import') & (df_InputData['GACUBE_OPTION'] < 1080) & (df_InputData['GACUBE_OPTION'] > 0), 1, np.where(df_InputData['GACUBE_OPTION'] <= df_InputData['GA_CubeCovered'], 0, (df_InputData['GACUBE_OPTION'] - df_InputData['GA_CubeCovered'])) / np.where(df_InputData['ORDERTYPE'] == 'import', 1080, 600))
+    
+    df_InputData['WA_PTL_or_20ft_Count'] = np.where((df_InputData['ORDERTYPE'] == 'domestic') & (df_InputData['WA_PTL_or_20ft_Count'] < 1), 0, df_InputData.apply(lambda row: mround(row['WA_PTL_or_20ft_Count'], 1), axis=1))
+    df_InputData['NV_PTL_or_20ft_Count'] = np.where((df_InputData['ORDERTYPE'] == 'domestic') & (df_InputData['NV_PTL_or_20ft_Count'] < 1), 0, df_InputData.apply(lambda row: mround(row['NV_PTL_or_20ft_Count'], 1), axis=1))
+    df_InputData['NE_PTL_or_20ft_Count'] = np.where((df_InputData['ORDERTYPE'] == 'domestic') & (df_InputData['NE_PTL_or_20ft_Count'] < 1), 0, df_InputData.apply(lambda row: mround(row['NE_PTL_or_20ft_Count'], 1), axis=1))
+    df_InputData['TX_PTL_or_20ft_Count'] = np.where((df_InputData['ORDERTYPE'] == 'domestic') & (df_InputData['TX_PTL_or_20ft_Count'] < 1), 0, df_InputData.apply(lambda row: mround(row['TX_PTL_or_20ft_Count'], 1), axis=1))
+    df_InputData['IN_PTL_or_20ft_Count'] = np.where((df_InputData['ORDERTYPE'] == 'domestic') & (df_InputData['IN_PTL_or_20ft_Count'] < 1), 0, df_InputData.apply(lambda row: mround(row['IN_PTL_or_20ft_Count'], 1), axis=1))
+    df_InputData['PA_PTL_or_20ft_Count'] = np.where((df_InputData['ORDERTYPE'] == 'domestic') & (df_InputData['PA_PTL_or_20ft_Count'] < 1), 0, df_InputData.apply(lambda row: mround(row['PA_PTL_or_20ft_Count'], 1), axis=1))
+    df_InputData['GA_PTL_or_20ft_Count'] = np.where((df_InputData['ORDERTYPE'] == 'domestic') & (df_InputData['GA_PTL_or_20ft_Count'] < 1), 0, df_InputData.apply(lambda row: mround(row['GA_PTL_or_20ft_Count'], 1), axis=1))
+
+    df_InputData['WA_CubeCovered'] = df_InputData['WA_CubeCovered'] + (df_InputData['WA_PTL_or_20ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 1100, 600))
+    df_InputData['NV_CubeCovered'] = df_InputData['NV_CubeCovered'] + (df_InputData['NV_PTL_or_20ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 1100, 600))
+    df_InputData['NE_CubeCovered'] = df_InputData['NE_CubeCovered'] + (df_InputData['NE_PTL_or_20ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 1100, 600))
+    df_InputData['TX_CubeCovered'] = df_InputData['TX_CubeCovered'] + (df_InputData['TX_PTL_or_20ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 1100, 600))
+    df_InputData['IN_CubeCovered'] = df_InputData['IN_CubeCovered'] + (df_InputData['IN_PTL_or_20ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 1100, 600))
+    df_InputData['PA_CubeCovered'] = df_InputData['PA_CubeCovered'] + (df_InputData['PA_PTL_or_20ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 1100, 600))
+    df_InputData['GA_CubeCovered'] = df_InputData['GA_CubeCovered'] + (df_InputData['GA_PTL_or_20ft_Count'] * np.where(df_InputData['ORDERTYPE'] == 'import', 1100, 600))
+    df_InputData['WA_20PTL_CubeCovered'] = np.where(df_InputData['WA_PTL_or_20ft_Count'] > 0, df_InputData['WACUBE_OPTION'] - df_InputData['WA_40FTL_CubeCovered'], 0)
+    df_InputData['NV_20PTL_CubeCovered'] = np.where(df_InputData['NV_PTL_or_20ft_Count'] > 0, df_InputData['NVCUBE_OPTION'] - df_InputData['NV_40FTL_CubeCovered'], 0)
+    df_InputData['NE_20PTL_CubeCovered'] = np.where(df_InputData['NE_PTL_or_20ft_Count'] > 0, df_InputData['NECUBE_OPTION'] - df_InputData['NE_40FTL_CubeCovered'], 0)
+    df_InputData['TX_20PTL_CubeCovered'] = np.where(df_InputData['TX_PTL_or_20ft_Count'] > 0, df_InputData['TXCUBE_OPTION'] - df_InputData['TX_40FTL_CubeCovered'], 0)
+    df_InputData['IN_20PTL_CubeCovered'] = np.where(df_InputData['IN_PTL_or_20ft_Count'] > 0, df_InputData['INCUBE_OPTION'] - df_InputData['IN_40FTL_CubeCovered'], 0)
+    df_InputData['PA_20PTL_CubeCovered'] = np.where(df_InputData['PA_PTL_or_20ft_Count'] > 0, df_InputData['PACUBE_OPTION'] - df_InputData['PA_40FTL_CubeCovered'], 0)
+    df_InputData['GA_20PTL_CubeCovered'] = np.where(df_InputData['GA_PTL_or_20ft_Count'] > 0, df_InputData['GACUBE_OPTION'] - df_InputData['GA_40FTL_CubeCovered'], 0)
+
+        #LTL   
+    df_InputData['WA_LTL_Count']  = np.where((df_InputData['WACUBE_OPTION'] <= df_InputData['WA_CubeCovered']) | (df_InputData['ORDERTYPE'] == 'import'), 0, (df_InputData['WACUBE_OPTION'] - df_InputData['WA_CubeCovered']) / 100)
+    df_InputData['NV_LTL_Count']  = np.where((df_InputData['NVCUBE_OPTION'] <= df_InputData['NV_CubeCovered']) | (df_InputData['ORDERTYPE'] == 'import'), 0, (df_InputData['NVCUBE_OPTION'] - df_InputData['NV_CubeCovered']) / 100)
+    df_InputData['NE_LTL_Count']  = np.where((df_InputData['NECUBE_OPTION'] <= df_InputData['NE_CubeCovered']) | (df_InputData['ORDERTYPE'] == 'import'), 0, (df_InputData['NECUBE_OPTION'] - df_InputData['NE_CubeCovered']) / 100)
+    df_InputData['TX_LTL_Count']  = np.where((df_InputData['TXCUBE_OPTION'] <= df_InputData['TX_CubeCovered']) | (df_InputData['ORDERTYPE'] == 'import'), 0, (df_InputData['TXCUBE_OPTION'] - df_InputData['TX_CubeCovered']) / 100)
+    df_InputData['IN_LTL_Count']  = np.where((df_InputData['INCUBE_OPTION'] <= df_InputData['IN_CubeCovered']) | (df_InputData['ORDERTYPE'] == 'import'), 0, (df_InputData['INCUBE_OPTION'] - df_InputData['IN_CubeCovered']) / 100)
+    df_InputData['PA_LTL_Count']  = np.where((df_InputData['PACUBE_OPTION'] <= df_InputData['PA_CubeCovered']) | (df_InputData['ORDERTYPE'] == 'import'), 0, (df_InputData['PACUBE_OPTION'] - df_InputData['PA_CubeCovered']) / 100)
+    df_InputData['GA_LTL_Count']  = np.where((df_InputData['GACUBE_OPTION'] <= df_InputData['GA_CubeCovered']) | (df_InputData['ORDERTYPE'] == 'import'), 0, (df_InputData['GACUBE_OPTION'] - df_InputData['GA_CubeCovered']) / 100)
+    
+    df_InputData['WA_LTL_Count'] = np.where(df_InputData['WA_LTL_Count'] < 1, 0, df_InputData.apply(lambda row: mround(row['WA_LTL_Count'], 1), axis=1))
+    df_InputData['NV_LTL_Count'] = np.where(df_InputData['NV_LTL_Count'] < 1, 0, df_InputData.apply(lambda row: mround(row['NV_LTL_Count'], 1), axis=1))
+    df_InputData['NE_LTL_Count'] = np.where(df_InputData['NE_LTL_Count'] < 1, 0, df_InputData.apply(lambda row: mround(row['NE_LTL_Count'], 1), axis=1))
+    df_InputData['TX_LTL_Count'] = np.where(df_InputData['TX_LTL_Count'] < 1, 0, df_InputData.apply(lambda row: mround(row['TX_LTL_Count'], 1), axis=1))
+    df_InputData['IN_LTL_Count'] = np.where(df_InputData['IN_LTL_Count'] < 1, 0, df_InputData.apply(lambda row: mround(row['IN_LTL_Count'], 1), axis=1))
+    df_InputData['PA_LTL_Count'] = np.where(df_InputData['PA_LTL_Count'] < 1, 0, df_InputData.apply(lambda row: mround(row['PA_LTL_Count'], 1), axis=1))
+    df_InputData['GA_LTL_Count'] = np.where(df_InputData['GA_LTL_Count'] < 1, 0, df_InputData.apply(lambda row: mround(row['GA_LTL_Count'], 1), axis=1))
+
+    df_InputData['WA_CubeCovered'] = df_InputData['WA_CubeCovered'] + (df_InputData['WA_LTL_Count'] * 100)
+    df_InputData['NV_CubeCovered'] = df_InputData['NV_CubeCovered'] + (df_InputData['NV_LTL_Count'] * 100)
+    df_InputData['NE_CubeCovered'] = df_InputData['NE_CubeCovered'] + (df_InputData['NE_LTL_Count'] * 100)
+    df_InputData['TX_CubeCovered'] = df_InputData['TX_CubeCovered'] + (df_InputData['TX_LTL_Count'] * 100)
+    df_InputData['IN_CubeCovered'] = df_InputData['IN_CubeCovered'] + (df_InputData['IN_LTL_Count'] * 100)
+    df_InputData['PA_CubeCovered'] = df_InputData['PA_CubeCovered'] + (df_InputData['PA_LTL_Count'] * 100)
+    df_InputData['GA_CubeCovered'] = df_InputData['GA_CubeCovered'] + (df_InputData['GA_LTL_Count'] * 100)
+    df_InputData['WA_LTL_CubeCovered'] = np.where(df_InputData['WA_LTL_Count'] > 0, df_InputData['WACUBE_OPTION'] - df_InputData['WA_40FTL_CubeCovered'] - df_InputData['WA_20PTL_CubeCovered'], 0)
+    df_InputData['NV_LTL_CubeCovered'] = np.where(df_InputData['NV_LTL_Count'] > 0, df_InputData['NVCUBE_OPTION'] - df_InputData['NV_40FTL_CubeCovered'] - df_InputData['NV_20PTL_CubeCovered'], 0)
+    df_InputData['NE_LTL_CubeCovered'] = np.where(df_InputData['NE_LTL_Count'] > 0, df_InputData['NECUBE_OPTION'] - df_InputData['NE_40FTL_CubeCovered'] - df_InputData['NE_20PTL_CubeCovered'], 0)
+    df_InputData['TX_LTL_CubeCovered'] = np.where(df_InputData['TX_LTL_Count'] > 0, df_InputData['TXCUBE_OPTION'] - df_InputData['TX_40FTL_CubeCovered'] - df_InputData['TX_20PTL_CubeCovered'], 0)
+    df_InputData['IN_LTL_CubeCovered'] = np.where(df_InputData['IN_LTL_Count'] > 0, df_InputData['INCUBE_OPTION'] - df_InputData['IN_40FTL_CubeCovered'] - df_InputData['IN_20PTL_CubeCovered'], 0)
+    df_InputData['PA_LTL_CubeCovered'] = np.where(df_InputData['PA_LTL_Count'] > 0, df_InputData['PACUBE_OPTION'] - df_InputData['PA_40FTL_CubeCovered'] - df_InputData['PA_20PTL_CubeCovered'], 0)
+    df_InputData['GA_LTL_CubeCovered'] = np.where(df_InputData['GA_LTL_Count'] > 0, df_InputData['GACUBE_OPTION'] - df_InputData['GA_40FTL_CubeCovered'] - df_InputData['GA_20PTL_CubeCovered'], 0)
+    
+        #Small Parcel
+    df_InputData['WA_SP_Count'] = np.where((df_InputData['ORDERTYPE'] == 'import') | (df_InputData['WACUBE_OPTION'] <= df_InputData['WA_CubeCovered']), 0, 
+                                           np.where(df_InputData['WACUBE_OPTION'] > 100, 0, df_InputData['WACUBE_OPTION'] - df_InputData['WA_CubeCovered']))
+    
+    df_InputData['NV_SP_Count'] = np.where((df_InputData['ORDERTYPE'] == 'import') | (df_InputData['NVCUBE_OPTION'] <= df_InputData['NV_CubeCovered']), 0, 
+                                           np.where(df_InputData['NVCUBE_OPTION'] > 100, 0, df_InputData['NVCUBE_OPTION'] - df_InputData['NV_CubeCovered']))
+    
+    df_InputData['NE_SP_Count'] = np.where((df_InputData['ORDERTYPE'] == 'import') | (df_InputData['NECUBE_OPTION'] <= df_InputData['NE_CubeCovered']), 0,
+                                           np.where(df_InputData['NECUBE_OPTION'] > 100, 0, df_InputData['NECUBE_OPTION'] - df_InputData['NE_CubeCovered']))
+    
+    df_InputData['TX_SP_Count'] = np.where((df_InputData['ORDERTYPE'] == 'import') | (df_InputData['TXCUBE_OPTION'] <= df_InputData['TX_CubeCovered']), 0, 
+                                           np.where(df_InputData['TXCUBE_OPTION'] > 100, 0, df_InputData['TXCUBE_OPTION'] - df_InputData['TX_CubeCovered']))
+    
+    df_InputData['IN_SP_Count'] = np.where((df_InputData['ORDERTYPE'] == 'import') | (df_InputData['INCUBE_OPTION'] <= df_InputData['IN_CubeCovered']), 0, 
+                                           np.where(df_InputData['INCUBE_OPTION'] > 100, 0, df_InputData['INCUBE_OPTION'] - df_InputData['IN_CubeCovered']))
+    
+    df_InputData['PA_SP_Count'] = np.where((df_InputData['ORDERTYPE'] == 'import') | (df_InputData['PACUBE_OPTION'] <= df_InputData['PA_CubeCovered']), 0, 
+                                           np.where(df_InputData['PACUBE_OPTION'] > 100, 0, df_InputData['PACUBE_OPTION'] - df_InputData['PA_CubeCovered']))
+    
+    df_InputData['GA_SP_Count'] = np.where((df_InputData['ORDERTYPE'] == 'import') | (df_InputData['GACUBE_OPTION'] <= df_InputData['GA_CubeCovered']), 0, 
+                                           np.where(df_InputData['GACUBE_OPTION'] > 100, 0, df_InputData['GACUBE_OPTION'] - df_InputData['GA_CubeCovered']))
+    
+    # df_InputData = df_InputData.drop(columns=['WA_CubeCovered', 'NV_CubeCovered', 'NE_CubeCovered', 'TX_CubeCovered', 'IN_CubeCovered', 'PA_CubeCovered', 'GA_CubeCovered'])
+
+    OriginData = """
+    Select * from INVENTORYSANDBOX.DBO.ER_ORIGINDATA
+                   """
+    df_OriginData = session.sql(OriginData)
+    df_OriginData = df_OriginData.to_pandas()
+    df_InputData = pd.merge(df_InputData, df_OriginData, how='left', on=['SUPPLIERID', 'ORDERTYPE'])
+
+    df_InputData['ORIGIN_PLACEHOLDER'] = np.where(df_InputData['ORDERTYPE'] == 'domestic', 'CA', 'CN')
+    df_InputData['ORIGIN'].fillna(df_InputData['ORIGIN_PLACEHOLDER'], inplace=True)
+    df_InputData = df_InputData.drop(columns=['ORIGIN_PLACEHOLDER'])
+    
+#Temp Need to Setup Origin Logic - 8/4/2024
+    # df_InputData['ORIGIN'] = np.where(df_InputData['ORDERTYPE'] == 'domestic', 'CA', 'CN')
+
+#Adjust Warehouse Size
+    # update_command = "ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'LARGE'"
+    # session.sql(update_command).collect()
+
+        #Optional - View Output   
+    #df_InputData = session.create_dataframe(df_InputData)
+    #return df_InputData#.filter(col("SUPPLIERID") == '1688');
+
+
+###################
+    #Inbound Freight Cost Below
+###################   
+
+#Gather Cost per Cube Data
+    CPC_Data = """     
+    Select 
+        CASE WHEN ORDERTYPE = 'Domestic' THEN 'domestic' WHEN ORDERTYPE = 'Import' THEN 'import' ELSE ORDERTYPE END as ORDERTYPE,
+        ORIGIN,
+        IFNULL(MIN(CASE WHEN FC = 'WA' AND FREIGHT_TYPE = '40ft' THEN CPC * 1 END), 1.621304348) as WA_CPC_40ft, IFNULL(MIN(CASE WHEN FC = 'NV' AND FREIGHT_TYPE = '40ft' THEN CPC * 1 END), 1.987826087) as NV_CPC_40ft, 
+        IFNULL(MIN(CASE WHEN FC = 'NE' AND FREIGHT_TYPE = '40ft' THEN CPC * 1 END), 2.799565217) as NE_CPC_40ft, IFNULL(MIN(CASE WHEN FC = 'TX' AND FREIGHT_TYPE = '40ft' THEN CPC * 1 END), 2.573043478) as TX_CPC_40ft,
+        IFNULL(MIN(CASE WHEN FC = 'IN' AND FREIGHT_TYPE = '40ft' THEN CPC * 1 END), 2.693478261) as IN_CPC_40ft, IFNULL(MIN(CASE WHEN FC = 'PA' AND FREIGHT_TYPE = '40ft' THEN CPC * 1 END), 2.287826087) as PA_CPC_40ft, 
+        IFNULL(MIN(CASE WHEN FC = 'GA' AND FREIGHT_TYPE = '40ft' THEN CPC * 1 END), 1.970869565) as GA_CPC_40ft,
+        IFNULL(MIN(CASE WHEN FC = 'WA' AND FREIGHT_TYPE = '20ft' THEN CPC * 1 END), 3.16965) as WA_CPC_20ft, IFNULL(MIN(CASE WHEN FC = 'NV' AND FREIGHT_TYPE = '20ft' THEN CPC * 1 END), 3.8862) as NV_CPC_20ft, 
+        IFNULL(MIN(CASE WHEN FC = 'NE' AND FREIGHT_TYPE = '20ft' THEN CPC * 1 END), 5.64217375) as NE_CPC_20ft, IFNULL(MIN(CASE WHEN FC = 'TX' AND FREIGHT_TYPE = '20ft' THEN CPC * 1 END), 5.162584706) as TX_CPC_20ft,
+        IFNULL(MIN(CASE WHEN FC = 'IN' AND FREIGHT_TYPE = '20ft' THEN CPC * 1 END), 5.453863014) as IN_CPC_20ft, IFNULL(MIN(CASE WHEN FC = 'PA' AND FREIGHT_TYPE = '20ft' THEN CPC * 1 END), 4.472949384) as PA_CPC_20ft, 
+        IFNULL(MIN(CASE WHEN FC = 'GA' AND FREIGHT_TYPE = '20ft' THEN CPC * 1 END), 4.239966256) as GA_CPC_20ft,
+        IFNULL(MIN(CASE WHEN FC = 'WA' AND FREIGHT_TYPE = 'FTL' THEN CPC * 1 END), 1) as WA_CPC_FTL, IFNULL(MIN(CASE WHEN FC = 'NV' AND FREIGHT_TYPE = 'FTL' THEN CPC * 1 END), 1.07) as NV_CPC_FTL, 
+        IFNULL(MIN(CASE WHEN FC = 'NE' AND FREIGHT_TYPE = 'FTL' THEN CPC * 1 END), 1) as NE_CPC_FTL, IFNULL(MIN(CASE WHEN FC = 'TX' AND FREIGHT_TYPE = 'FTL' THEN CPC * 1 END), .99) as TX_CPC_FTL,
+        IFNULL(MIN(CASE WHEN FC = 'IN' AND FREIGHT_TYPE = 'FTL' THEN CPC * 1 END), 1.02) as IN_CPC_FTL, IFNULL(MIN(CASE WHEN FC = 'PA' AND FREIGHT_TYPE = 'FTL' THEN CPC * 1 END), 1.04) as PA_CPC_FTL, 
+        IFNULL(MIN(CASE WHEN FC = 'GA' AND FREIGHT_TYPE = 'FTL' THEN CPC * 1 END), 1.05) as GA_CPC_FTL,
+        IFNULL(MIN(CASE WHEN FC = 'WA' AND FREIGHT_TYPE = 'PTL' THEN CPC * 1 END), 1.71) as WA_CPC_PTL, IFNULL(MIN(CASE WHEN FC = 'NV' AND FREIGHT_TYPE = 'PTL' THEN CPC * 1 END), 1.56) as NV_CPC_PTL, 
+        IFNULL(MIN(CASE WHEN FC = 'NE' AND FREIGHT_TYPE = 'PTL' THEN CPC * 1 END), 1.66) as NE_CPC_PTL, IFNULL(MIN(CASE WHEN FC = 'TX' AND FREIGHT_TYPE = 'PTL' THEN CPC * 1 END), 1.46) as TX_CPC_PTL,
+        IFNULL(MIN(CASE WHEN FC = 'IN' AND FREIGHT_TYPE = 'PTL' THEN CPC * 1 END), 1.57) as IN_CPC_PTL, IFNULL(MIN(CASE WHEN FC = 'PA' AND FREIGHT_TYPE = 'PTL' THEN CPC * 1 END), 1.66) as PA_CPC_PTL, 
+        IFNULL(MIN(CASE WHEN FC = 'GA' AND FREIGHT_TYPE = 'PTL' THEN CPC * 1 END), 1.65) as GA_CPC_PTL,
+        IFNULL(MIN(CASE WHEN FC = 'WA' AND FREIGHT_TYPE = 'LTL' THEN CPC * 1 END), 2.55) as WA_CPC_LTL, IFNULL(MIN(CASE WHEN FC = 'NV' AND FREIGHT_TYPE = 'LTL' THEN CPC * 1 END), 2.44) as NV_CPC_LTL, 
+        IFNULL(MIN(CASE WHEN FC = 'NE' AND FREIGHT_TYPE = 'LTL' THEN CPC * 1 END), 2.31) as NE_CPC_LTL, IFNULL(MIN(CASE WHEN FC = 'TX' AND FREIGHT_TYPE = 'LTL' THEN CPC * 1 END), 2.26) as TX_CPC_LTL,
+        IFNULL(MIN(CASE WHEN FC = 'IN' AND FREIGHT_TYPE = 'LTL' THEN CPC * 1 END), 2.20) as IN_CPC_LTL, IFNULL(MIN(CASE WHEN FC = 'PA' AND FREIGHT_TYPE = 'LTL' THEN CPC * 1 END), 2.32) as PA_CPC_LTL, 
+        IFNULL(MIN(CASE WHEN FC = 'GA' AND FREIGHT_TYPE = 'LTL' THEN CPC * 1 END), 2.37) as GA_CPC_LTL,
+        10.37 as WA_CPC_SP, 7.33 as NV_CPC_SP, 4.89 as NE_CPC_SP, 5.34 as TX_CPC_SP, 5.06 as IN_CPC_SP, 3.63 as PA_CPC_SP, 3.63 as GA_CPC_SP
+    from INVENTORYSANDBOX.DBO.ER_TEMP_CPC_20240804
+    -- Where ORDERTYPE = 'domestic' AND ORIGIN = 'CA'
+    GROUP BY ORDERTYPE, ORIGIN--) as CPC on CPC.ORDERTYPE = setup.ordertype AND CPC.ORIGIN = setup.origin
+    """
+    df_CPC_Data = session.sql(CPC_Data)
+    df_CPC_Data = df_CPC_Data.to_pandas()
+    df_InputData = pd.merge(df_InputData, df_CPC_Data, how='left', on=['ORDERTYPE', 'ORIGIN'])
+
+
+        #Generate Pallet Counts to Apply Multipliers
+    df_InputData['WA_PALLET_COUNT'] = np.where(df_InputData['WA_SP_Count'] > 0, 1, np.ceil(np.minimum(df_InputData['WACUBE_OPTION'] / 85, 28)))
+    df_InputData['NV_PALLET_COUNT'] = np.where(df_InputData['NV_SP_Count'] > 0, 1, np.ceil(np.minimum(df_InputData['NVCUBE_OPTION'] / 85, 28)))
+    df_InputData['NE_PALLET_COUNT'] = np.where(df_InputData['NE_SP_Count'] > 0, 1, np.ceil(np.minimum(df_InputData['NECUBE_OPTION'] / 85, 28)))
+    df_InputData['TX_PALLET_COUNT'] = np.where(df_InputData['TX_SP_Count'] > 0, 1, np.ceil(np.minimum(df_InputData['TXCUBE_OPTION'] / 85, 28)))
+    df_InputData['IN_PALLET_COUNT'] = np.where(df_InputData['IN_SP_Count'] > 0, 1, np.ceil(np.minimum(df_InputData['INCUBE_OPTION'] / 85, 28)))
+    df_InputData['PA_PALLET_COUNT'] = np.where(df_InputData['PA_SP_Count'] > 0, 1, np.ceil(np.minimum(df_InputData['PACUBE_OPTION'] / 85, 28)))
+    df_InputData['GA_PALLET_COUNT'] = np.where(df_InputData['GA_SP_Count'] > 0, 1, np.ceil(np.minimum(df_InputData['GACUBE_OPTION'] / 85, 28)))
+
+    df_InputData['WA_FREIGHT_TYPE'] = np.where(df_InputData['WA_FTL_or_40ft_Count'] > 0, 'FTL', np.where(df_InputData['WA_PTL_or_20ft_Count'] > 0, 'PTL', np.where(df_InputData['WA_LTL_Count'] > 0, 'LTL', 'SP')))
+    df_InputData['NV_FREIGHT_TYPE'] = np.where(df_InputData['NV_FTL_or_40ft_Count'] > 0, 'FTL', np.where(df_InputData['NV_PTL_or_20ft_Count'] > 0, 'PTL', np.where(df_InputData['NV_LTL_Count'] > 0, 'LTL', 'SP')))
+    df_InputData['NE_FREIGHT_TYPE'] = np.where(df_InputData['NE_FTL_or_40ft_Count'] > 0, 'FTL', np.where(df_InputData['NE_PTL_or_20ft_Count'] > 0, 'PTL', np.where(df_InputData['NE_LTL_Count'] > 0, 'LTL', 'SP')))
+    df_InputData['TX_FREIGHT_TYPE'] = np.where(df_InputData['TX_FTL_or_40ft_Count'] > 0, 'FTL', np.where(df_InputData['TX_PTL_or_20ft_Count'] > 0, 'PTL', np.where(df_InputData['TX_LTL_Count'] > 0, 'LTL', 'SP')))
+    df_InputData['IN_FREIGHT_TYPE'] = np.where(df_InputData['IN_FTL_or_40ft_Count'] > 0, 'FTL', np.where(df_InputData['IN_PTL_or_20ft_Count'] > 0, 'PTL', np.where(df_InputData['IN_LTL_Count'] > 0, 'LTL', 'SP')))
+    df_InputData['PA_FREIGHT_TYPE'] = np.where(df_InputData['PA_FTL_or_40ft_Count'] > 0, 'FTL', np.where(df_InputData['PA_PTL_or_20ft_Count'] > 0, 'PTL', np.where(df_InputData['PA_LTL_Count'] > 0, 'LTL', 'SP')))
+    df_InputData['GA_FREIGHT_TYPE'] = np.where(df_InputData['GA_FTL_or_40ft_Count'] > 0, 'FTL', np.where(df_InputData['GA_PTL_or_20ft_Count'] > 0, 'PTL', np.where(df_InputData['GA_LTL_Count'] > 0, 'LTL', 'SP')))
+
+    CPC_Multi = """     
+    Select 
+        MULTI.*, 
+        FREIGHT_TYPE as WA_FREIGHT_TYPE, FREIGHT_TYPE as NV_FREIGHT_TYPE, FREIGHT_TYPE as NE_FREIGHT_TYPE, FREIGHT_TYPE as TX_FREIGHT_TYPE, FREIGHT_TYPE as IN_FREIGHT_TYPE, FREIGHT_TYPE as PA_FREIGHT_TYPE, FREIGHT_TYPE as GA_FREIGHT_TYPE,
+        PALLET_COUNT as WA_Pallet_Count, PALLET_COUNT as NV_Pallet_Count, PALLET_COUNT as NE_Pallet_Count, PALLET_COUNT as TX_Pallet_Count, PALLET_COUNT as IN_Pallet_Count, PALLET_COUNT as PA_Pallet_Count, PALLET_COUNT as GA_Pallet_Count,
+        CPC_MULTI as WA_CPC_MULTI, CPC_MULTI as NV_CPC_MULTI, CPC_MULTI as NE_CPC_MULTI, CPC_MULTI as TX_CPC_MULTI, CPC_MULTI as IN_CPC_MULTI, CPC_MULTI as PA_CPC_MULTI, CPC_MULTI as GA_CPC_MULTI
+    from INVENTORYSANDBOX.DBO.ER_TEMP_CPC_MULTIPLIER MULTI
+    """
+    df_CPC_Multi = session.sql(CPC_Multi)
+    df_CPC_Multi = df_CPC_Multi.to_pandas()
+    
+    df_WA_CPC_Multi = df_CPC_Multi[['WA_FREIGHT_TYPE', 'WA_PALLET_COUNT', 'WA_CPC_MULTI']]
+    df_InputData = pd.merge(df_InputData, df_WA_CPC_Multi, how='left', on=['WA_FREIGHT_TYPE', 'WA_PALLET_COUNT'])
+    df_InputData['WA_CPC_MULTI'].fillna(1, inplace=True)
+    
+    df_NV_CPC_Multi = df_CPC_Multi[['NV_FREIGHT_TYPE', 'NV_PALLET_COUNT', 'NV_CPC_MULTI']]
+    df_InputData = pd.merge(df_InputData, df_NV_CPC_Multi, how='left', on=['NV_FREIGHT_TYPE', 'NV_PALLET_COUNT'])
+    df_InputData['NV_CPC_MULTI'].fillna(1, inplace=True)
+    
+    df_NE_CPC_Multi = df_CPC_Multi[['NE_FREIGHT_TYPE', 'NE_PALLET_COUNT', 'NE_CPC_MULTI']]
+    df_InputData = pd.merge(df_InputData, df_NE_CPC_Multi, how='left', on=['NE_FREIGHT_TYPE', 'NE_PALLET_COUNT'])
+    df_InputData['NE_CPC_MULTI'].fillna(1, inplace=True)
+    
+    df_TX_CPC_Multi = df_CPC_Multi[['TX_FREIGHT_TYPE', 'TX_PALLET_COUNT', 'TX_CPC_MULTI']]
+    df_InputData = pd.merge(df_InputData, df_TX_CPC_Multi, how='left', on=['TX_FREIGHT_TYPE', 'TX_PALLET_COUNT'])
+    df_InputData['TX_CPC_MULTI'].fillna(1, inplace=True)
+    
+    df_IN_CPC_Multi = df_CPC_Multi[['IN_FREIGHT_TYPE', 'IN_PALLET_COUNT', 'IN_CPC_MULTI']]
+    df_InputData = pd.merge(df_InputData, df_IN_CPC_Multi, how='left', on=['IN_FREIGHT_TYPE', 'IN_PALLET_COUNT'])
+    df_InputData['IN_CPC_MULTI'].fillna(1, inplace=True)
+    
+    df_PA_CPC_Multi = df_CPC_Multi[['PA_FREIGHT_TYPE', 'PA_PALLET_COUNT', 'PA_CPC_MULTI']]
+    df_InputData = pd.merge(df_InputData, df_PA_CPC_Multi, how='left', on=['PA_FREIGHT_TYPE', 'PA_PALLET_COUNT'])
+    df_InputData['PA_CPC_MULTI'].fillna(1, inplace=True)
+    
+    df_GA_CPC_Multi = df_CPC_Multi[['GA_FREIGHT_TYPE', 'GA_PALLET_COUNT', 'GA_CPC_MULTI']]
+    df_InputData = pd.merge(df_InputData, df_GA_CPC_Multi, how='left', on=['GA_FREIGHT_TYPE', 'GA_PALLET_COUNT'])
+    df_InputData['GA_CPC_MULTI'].fillna(1, inplace=True)
+
+    df_InputData = df_InputData.drop(columns=['WA_PALLET_COUNT', 'NV_PALLET_COUNT', 'NE_PALLET_COUNT', 'TX_PALLET_COUNT', 'IN_PALLET_COUNT', 'PA_PALLET_COUNT', 'GA_PALLET_COUNT'])
+    df_InputData = df_InputData.drop(columns=['WA_FREIGHT_TYPE', 'NV_FREIGHT_TYPE', 'NE_FREIGHT_TYPE', 'TX_FREIGHT_TYPE', 'IN_FREIGHT_TYPE', 'PA_FREIGHT_TYPE', 'GA_FREIGHT_TYPE'])
+    df_InputData = df_InputData.drop(columns=['WA_CubeCovered', 'NV_CubeCovered', 'NE_CubeCovered', 'TX_CubeCovered', 'IN_CubeCovered', 'PA_CubeCovered', 'GA_CubeCovered'])
+
+#Container / FTL Fill Multipliers
+    #WA Container Multiplier
+    df_InputData['WA_Cont_Baseline_ContCount_Min'] = (df_InputData['WACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['WA_Cont_Baseline_ContCount_Max'] = (df_InputData['WACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000))
+    df_InputData['WA_Cont_Roundup_Target_Min'] = np.ceil(df_InputData['WACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['WA_Cont_Rounddown_Target_Min'] = np.floor(df_InputData['WACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['WA_Cont_Fill_Multi'] = np.where(df_InputData['WA_FTL_or_40ft_Count'] == 0, 1,
+                                                  np.where(np.floor(df_InputData['WACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)) == np.ceil(df_InputData['WACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000)), 1,
+                                                  1 / ( 1 - ((np.minimum(np.minimum(np.abs(df_InputData['WA_Cont_Roundup_Target_Min'] - df_InputData['WA_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['WA_Cont_Baseline_ContCount_Min'] - df_InputData['WA_Cont_Rounddown_Target_Min'])),
+                                                             np.minimum(np.abs(df_InputData['WA_Cont_Roundup_Target_Min'] - df_InputData['WA_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['WA_Cont_Baseline_ContCount_Max'] - df_InputData['WA_Cont_Rounddown_Target_Min'])))) / df_InputData['WA_Cont_Roundup_Target_Min']))))
+    df_InputData = df_InputData.drop(columns=['WA_Cont_Baseline_ContCount_Min', 'WA_Cont_Baseline_ContCount_Max', 'WA_Cont_Roundup_Target_Min', 'WA_Cont_Rounddown_Target_Min'])
+
+    #NV Container Multiplier
+    df_InputData['NV_Cont_Baseline_ContCount_Min'] = (df_InputData['NVCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NV_Cont_Baseline_ContCount_Max'] = (df_InputData['NVCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000))
+    df_InputData['NV_Cont_Roundup_Target_Min'] = np.ceil(df_InputData['NVCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NV_Cont_Rounddown_Target_Min'] = np.floor(df_InputData['NVCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NV_Cont_Fill_Multi'] = np.where(df_InputData['NV_FTL_or_40ft_Count'] == 0, 1,
+                                                  np.where(np.floor(df_InputData['NVCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)) == np.ceil(df_InputData['NVCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000)), 1,
+                                                  1 / ( 1 - ((np.minimum(np.minimum(np.abs(df_InputData['NV_Cont_Roundup_Target_Min'] - df_InputData['NV_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['NV_Cont_Baseline_ContCount_Min'] - df_InputData['NV_Cont_Rounddown_Target_Min'])),
+                                                             np.minimum(np.abs(df_InputData['NV_Cont_Roundup_Target_Min'] - df_InputData['NV_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['NV_Cont_Baseline_ContCount_Max'] - df_InputData['NV_Cont_Rounddown_Target_Min'])))) / df_InputData['NV_Cont_Roundup_Target_Min']))))
+    df_InputData = df_InputData.drop(columns=['NV_Cont_Baseline_ContCount_Min', 'NV_Cont_Baseline_ContCount_Max', 'NV_Cont_Roundup_Target_Min', 'NV_Cont_Rounddown_Target_Min'])
+    
+    #NE Container Multiplier
+    df_InputData['NE_Cont_Baseline_ContCount_Min'] = (df_InputData['NECUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NE_Cont_Baseline_ContCount_Max'] = (df_InputData['NECUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000))
+    df_InputData['NE_Cont_Roundup_Target_Min'] = np.ceil(df_InputData['NECUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NE_Cont_Rounddown_Target_Min'] = np.floor(df_InputData['NECUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['NE_Cont_Fill_Multi'] = np.where(df_InputData['NE_FTL_or_40ft_Count'] == 0, 1,
+                                                  np.where(np.floor(df_InputData['NECUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)) == np.ceil(df_InputData['NECUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000)), 1,
+                                                  1 / ( 1 - ((np.minimum(np.minimum(np.abs(df_InputData['NE_Cont_Roundup_Target_Min'] - df_InputData['NE_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['NE_Cont_Baseline_ContCount_Min'] - df_InputData['NE_Cont_Rounddown_Target_Min'])),
+                                                             np.minimum(np.abs(df_InputData['NE_Cont_Roundup_Target_Min'] - df_InputData['NE_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['NE_Cont_Baseline_ContCount_Max'] - df_InputData['NE_Cont_Rounddown_Target_Min'])))) / df_InputData['NE_Cont_Roundup_Target_Min']))))
+    df_InputData = df_InputData.drop(columns=['NE_Cont_Baseline_ContCount_Min', 'NE_Cont_Baseline_ContCount_Max', 'NE_Cont_Roundup_Target_Min', 'NE_Cont_Rounddown_Target_Min'])
+
+    #TX Container Multiplier
+    df_InputData['TX_Cont_Baseline_ContCount_Min'] = (df_InputData['TXCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['TX_Cont_Baseline_ContCount_Max'] = (df_InputData['TXCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000))
+    df_InputData['TX_Cont_Roundup_Target_Min'] = np.ceil(df_InputData['TXCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['TX_Cont_Rounddown_Target_Min'] = np.floor(df_InputData['TXCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['TX_Cont_Fill_Multi'] = np.where(df_InputData['TX_FTL_or_40ft_Count'] == 0, 1,
+                                                  np.where(np.floor(df_InputData['TXCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)) == np.ceil(df_InputData['TXCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000)), 1,
+                                                  1 / ( 1 - ((np.minimum(np.minimum(np.abs(df_InputData['TX_Cont_Roundup_Target_Min'] - df_InputData['TX_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['TX_Cont_Baseline_ContCount_Min'] - df_InputData['TX_Cont_Rounddown_Target_Min'])),
+                                                             np.minimum(np.abs(df_InputData['TX_Cont_Roundup_Target_Min'] - df_InputData['TX_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['TX_Cont_Baseline_ContCount_Max'] - df_InputData['TX_Cont_Rounddown_Target_Min'])))) / df_InputData['TX_Cont_Roundup_Target_Min']))))
+    df_InputData = df_InputData.drop(columns=['TX_Cont_Baseline_ContCount_Min', 'TX_Cont_Baseline_ContCount_Max', 'TX_Cont_Roundup_Target_Min', 'TX_Cont_Rounddown_Target_Min'])
+
+    #IN Container Multiplier
+    df_InputData['IN_Cont_Baseline_ContCount_Min'] = (df_InputData['INCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['IN_Cont_Baseline_ContCount_Max'] = (df_InputData['INCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000))
+    df_InputData['IN_Cont_Roundup_Target_Min'] = np.ceil(df_InputData['INCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['IN_Cont_Rounddown_Target_Min'] = np.floor(df_InputData['INCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['IN_Cont_Fill_Multi'] = np.where(df_InputData['IN_FTL_or_40ft_Count'] == 0, 1,
+                                                  np.where(np.floor(df_InputData['INCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)) == np.ceil(df_InputData['INCUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000)), 1,
+                                                  1 / ( 1 - ((np.minimum(np.minimum(np.abs(df_InputData['IN_Cont_Roundup_Target_Min'] - df_InputData['IN_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['IN_Cont_Baseline_ContCount_Min'] - df_InputData['IN_Cont_Rounddown_Target_Min'])),
+                                                             np.minimum(np.abs(df_InputData['IN_Cont_Roundup_Target_Min'] - df_InputData['IN_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['IN_Cont_Baseline_ContCount_Max'] - df_InputData['IN_Cont_Rounddown_Target_Min'])))) / df_InputData['IN_Cont_Roundup_Target_Min']))))
+    df_InputData = df_InputData.drop(columns=['IN_Cont_Baseline_ContCount_Min', 'IN_Cont_Baseline_ContCount_Max', 'IN_Cont_Roundup_Target_Min', 'IN_Cont_Rounddown_Target_Min'])
+
+    #PA Container Multiplier
+    df_InputData['PA_Cont_Baseline_ContCount_Min'] = (df_InputData['PACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['PA_Cont_Baseline_ContCount_Max'] = (df_InputData['PACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000))
+    df_InputData['PA_Cont_Roundup_Target_Min'] = np.ceil(df_InputData['PACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['PA_Cont_Rounddown_Target_Min'] = np.floor(df_InputData['PACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['PA_Cont_Fill_Multi'] = np.where(df_InputData['PA_FTL_or_40ft_Count'] == 0, 1,
+                                                  np.where(np.floor(df_InputData['PACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)) == np.ceil(df_InputData['PACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000)), 1,
+                                                  1 / ( 1 - ((np.minimum(np.minimum(np.abs(df_InputData['PA_Cont_Roundup_Target_Min'] - df_InputData['PA_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['PA_Cont_Baseline_ContCount_Min'] - df_InputData['PA_Cont_Rounddown_Target_Min'])),
+                                                             np.minimum(np.abs(df_InputData['PA_Cont_Roundup_Target_Min'] - df_InputData['PA_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['PA_Cont_Baseline_ContCount_Max'] - df_InputData['PA_Cont_Rounddown_Target_Min'])))) / df_InputData['PA_Cont_Roundup_Target_Min']))))
+    df_InputData = df_InputData.drop(columns=['PA_Cont_Baseline_ContCount_Min', 'PA_Cont_Baseline_ContCount_Max', 'PA_Cont_Roundup_Target_Min', 'PA_Cont_Rounddown_Target_Min'])
+
+    #GA Container Multiplier
+    df_InputData['GA_Cont_Baseline_ContCount_Min'] = (df_InputData['GACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['GA_Cont_Baseline_ContCount_Max'] = (df_InputData['GACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000))
+    df_InputData['GA_Cont_Roundup_Target_Min'] = np.ceil(df_InputData['GACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['GA_Cont_Rounddown_Target_Min'] = np.floor(df_InputData['GACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750))
+    df_InputData['GA_Cont_Fill_Multi'] = np.where(df_InputData['GA_FTL_or_40ft_Count'] == 0, 1,
+                                                  np.where(np.floor(df_InputData['GACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2300, 2750)) == np.ceil(df_InputData['GACUBE_OPTION'] / np.where(df_InputData['ORDERTYPE'] == 'import', 2650, 3000)), 1,
+                                                  1 / ( 1 - ((np.minimum(np.minimum(np.abs(df_InputData['GA_Cont_Roundup_Target_Min'] - df_InputData['GA_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['GA_Cont_Baseline_ContCount_Min'] - df_InputData['GA_Cont_Rounddown_Target_Min'])),
+                                                             np.minimum(np.abs(df_InputData['GA_Cont_Roundup_Target_Min'] - df_InputData['GA_Cont_Baseline_ContCount_Min']), np.abs(df_InputData['GA_Cont_Baseline_ContCount_Max'] - df_InputData['GA_Cont_Rounddown_Target_Min'])))) / df_InputData['GA_Cont_Roundup_Target_Min']))))
+    df_InputData = df_InputData.drop(columns=['GA_Cont_Baseline_ContCount_Min', 'GA_Cont_Baseline_ContCount_Max', 'GA_Cont_Roundup_Target_Min', 'GA_Cont_Rounddown_Target_Min'])
+
+    df_InputData['WA_CPC_FTL'] = df_InputData['WA_CPC_FTL'] * df_InputData['WA_Cont_Fill_Multi'] * df_InputData['WA_CPC_MULTI']
+    df_InputData['NV_CPC_FTL'] = df_InputData['NV_CPC_FTL'] * df_InputData['NV_Cont_Fill_Multi'] * df_InputData['NV_CPC_MULTI']
+    df_InputData['NE_CPC_FTL'] = df_InputData['NE_CPC_FTL'] * df_InputData['NE_Cont_Fill_Multi'] * df_InputData['NE_CPC_MULTI']
+    df_InputData['TX_CPC_FTL'] = df_InputData['TX_CPC_FTL'] * df_InputData['TX_Cont_Fill_Multi'] * df_InputData['TX_CPC_MULTI']
+    df_InputData['IN_CPC_FTL'] = df_InputData['IN_CPC_FTL'] * df_InputData['IN_Cont_Fill_Multi'] * df_InputData['IN_CPC_MULTI']
+    df_InputData['PA_CPC_FTL'] = df_InputData['PA_CPC_FTL'] * df_InputData['PA_Cont_Fill_Multi'] * df_InputData['PA_CPC_MULTI']
+    df_InputData['GA_CPC_FTL'] = df_InputData['GA_CPC_FTL'] * df_InputData['GA_Cont_Fill_Multi'] * df_InputData['GA_CPC_MULTI']
+    df_InputData['WA_CPC_PTL'] = df_InputData['WA_CPC_PTL'] * df_InputData['WA_CPC_MULTI']
+    df_InputData['NV_CPC_PTL'] = df_InputData['NV_CPC_PTL'] * df_InputData['NV_CPC_MULTI']
+    df_InputData['NE_CPC_PTL'] = df_InputData['NE_CPC_PTL'] * df_InputData['NE_CPC_MULTI']
+    df_InputData['TX_CPC_PTL'] = df_InputData['TX_CPC_PTL'] * df_InputData['TX_CPC_MULTI']
+    df_InputData['IN_CPC_PTL'] = df_InputData['IN_CPC_PTL'] * df_InputData['IN_CPC_MULTI']
+    df_InputData['PA_CPC_PTL'] = df_InputData['PA_CPC_PTL'] * df_InputData['PA_CPC_MULTI']
+    df_InputData['GA_CPC_PTL'] = df_InputData['GA_CPC_PTL'] * df_InputData['GA_CPC_MULTI']
+    df_InputData['WA_CPC_LTL'] = df_InputData['WA_CPC_LTL'] * df_InputData['WA_CPC_MULTI']
+    df_InputData['NV_CPC_LTL'] = df_InputData['NV_CPC_LTL'] * df_InputData['NV_CPC_MULTI']
+    df_InputData['NE_CPC_LTL'] = df_InputData['NE_CPC_LTL'] * df_InputData['NE_CPC_MULTI']
+    df_InputData['TX_CPC_LTL'] = df_InputData['TX_CPC_LTL'] * df_InputData['TX_CPC_MULTI']
+    df_InputData['IN_CPC_LTL'] = df_InputData['IN_CPC_LTL'] * df_InputData['IN_CPC_MULTI']
+    df_InputData['PA_CPC_LTL'] = df_InputData['PA_CPC_LTL'] * df_InputData['PA_CPC_MULTI']
+    df_InputData['GA_CPC_LTL'] = df_InputData['GA_CPC_LTL'] * df_InputData['GA_CPC_MULTI']
+    df_InputData['WA_CPC_40FT'] = df_InputData['WA_CPC_40FT'] * df_InputData['WA_Cont_Fill_Multi']
+    df_InputData['NV_CPC_40FT'] = df_InputData['NV_CPC_40FT'] * df_InputData['NV_Cont_Fill_Multi']
+    df_InputData['NE_CPC_40FT'] = df_InputData['NE_CPC_40FT'] * df_InputData['NE_Cont_Fill_Multi']
+    df_InputData['TX_CPC_40FT'] = df_InputData['TX_CPC_40FT'] * df_InputData['TX_Cont_Fill_Multi']
+    df_InputData['IN_CPC_40FT'] = df_InputData['IN_CPC_40FT'] * df_InputData['IN_Cont_Fill_Multi']
+    df_InputData['PA_CPC_40FT'] = df_InputData['PA_CPC_40FT'] * df_InputData['PA_Cont_Fill_Multi']
+    df_InputData['GA_CPC_40FT'] = df_InputData['GA_CPC_40FT'] * df_InputData['GA_Cont_Fill_Multi']
+
+    df_InputData = df_InputData.drop(columns=['WA_Cont_Fill_Multi', 'NV_Cont_Fill_Multi', 'NE_Cont_Fill_Multi', 'TX_Cont_Fill_Multi', 'IN_Cont_Fill_Multi', 'PA_Cont_Fill_Multi', 'GA_Cont_Fill_Multi'])
+    df_InputData = df_InputData.drop(columns=['WA_CPC_MULTI', 'NV_CPC_MULTI', 'NE_CPC_MULTI', 'TX_CPC_MULTI', 'IN_CPC_MULTI', 'PA_CPC_MULTI', 'GA_CPC_MULTI'])
+    
+        #Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter((col("ORDERTYPE") == 'domestic') & (col("FC_COMBO_OPTION") == 'NE NV PA TX WA'));
+    
+        #Merge with Output Table
+    df_InputData['ORDERTYPE'] = np.where(df_InputData['ORDERTYPE'] == 'Import', 'import', np.where(df_InputData['ORDERTYPE'] == 'Domestic', 'domestic', df_InputData['ORDERTYPE']))
+    #df_InputData = pd.merge(df_InputData, df_FreightCPC, how='left', on=['ORDERTYPE', 'ORIGIN'])
+
+    df_InputData['WA_Freight_Cost'] = (df_InputData['WA_SP_Count'] * df_InputData['WA_CPC_SP']) + (df_InputData['WA_LTL_CubeCovered'] * df_InputData['WA_CPC_LTL']) + (df_InputData['WA_20PTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['WA_CPC_20FT'], df_InputData['WA_CPC_PTL'])) + (df_InputData['WA_40FTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['WA_CPC_40FT'], df_InputData['WA_CPC_FTL']))
+    df_InputData['NV_Freight_Cost'] = (df_InputData['NV_SP_Count'] * df_InputData['NV_CPC_SP']) + (df_InputData['NV_LTL_CubeCovered'] * df_InputData['NV_CPC_LTL']) + (df_InputData['NV_20PTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['NV_CPC_20FT'], df_InputData['NV_CPC_PTL'])) + (df_InputData['NV_40FTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['NV_CPC_40FT'], df_InputData['NV_CPC_FTL']))
+    df_InputData['NE_Freight_Cost'] = (df_InputData['NE_SP_Count'] * df_InputData['NE_CPC_SP']) + (df_InputData['NE_LTL_CubeCovered'] * df_InputData['NE_CPC_LTL']) + (df_InputData['NE_20PTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['NE_CPC_20FT'], df_InputData['NE_CPC_PTL'])) + (df_InputData['NE_40FTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['NE_CPC_40FT'], df_InputData['NE_CPC_FTL']))
+    df_InputData['TX_Freight_Cost'] = (df_InputData['TX_SP_Count'] * df_InputData['TX_CPC_SP']) + (df_InputData['TX_LTL_CubeCovered'] * df_InputData['TX_CPC_LTL']) + (df_InputData['TX_20PTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['TX_CPC_20FT'], df_InputData['TX_CPC_PTL'])) + (df_InputData['TX_40FTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['TX_CPC_40FT'], df_InputData['TX_CPC_FTL']))
+    df_InputData['IN_Freight_Cost'] = (df_InputData['IN_SP_Count'] * df_InputData['IN_CPC_SP']) + (df_InputData['IN_LTL_CubeCovered'] * df_InputData['IN_CPC_LTL']) + (df_InputData['IN_20PTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['IN_CPC_20FT'], df_InputData['IN_CPC_PTL'])) + (df_InputData['IN_40FTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['IN_CPC_40FT'], df_InputData['IN_CPC_FTL']))
+    df_InputData['PA_Freight_Cost'] = (df_InputData['PA_SP_Count'] * df_InputData['PA_CPC_SP']) + (df_InputData['PA_LTL_CubeCovered'] * df_InputData['PA_CPC_LTL']) + (df_InputData['PA_20PTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['PA_CPC_20FT'], df_InputData['PA_CPC_PTL'])) + (df_InputData['PA_40FTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['PA_CPC_40FT'], df_InputData['PA_CPC_FTL']))
+    df_InputData['GA_Freight_Cost'] = (df_InputData['GA_SP_Count'] * df_InputData['GA_CPC_SP']) + (df_InputData['GA_LTL_CubeCovered'] * df_InputData['GA_CPC_LTL']) + (df_InputData['GA_20PTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['GA_CPC_20FT'], df_InputData['GA_CPC_PTL'])) + (df_InputData['GA_40FTL_CubeCovered'] * np.where(df_InputData['ORDERTYPE'] == 'import', df_InputData['GA_CPC_40FT'], df_InputData['GA_CPC_FTL']))
+
+        #Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData.filter((col("ORDERTYPE") == 'domestic') & (col("FC_COMBO_OPTION") == 'NE NV PA TX WA'));
+    
+    df_InputData['Total_Freight_Cost'] = df_InputData['WA_Freight_Cost'] + df_InputData['NV_Freight_Cost'] + df_InputData['NE_Freight_Cost'] + df_InputData['TX_Freight_Cost'] + df_InputData['IN_Freight_Cost'] + df_InputData['PA_Freight_Cost'] + df_InputData['GA_Freight_Cost']
+    df_InputData = df_InputData.drop(columns=['WA_CPC_20FT', 'NV_CPC_20FT', 'NE_CPC_20FT', 'TX_CPC_20FT', 'IN_CPC_20FT', 'PA_CPC_20FT', 'GA_CPC_20FT'])
+    df_InputData = df_InputData.drop(columns=['WA_CPC_40FT', 'NV_CPC_40FT', 'NE_CPC_40FT', 'TX_CPC_40FT', 'IN_CPC_40FT', 'PA_CPC_40FT', 'GA_CPC_40FT'])
+    df_InputData = df_InputData.drop(columns=['WA_CPC_FTL', 'NV_CPC_FTL', 'NE_CPC_FTL', 'TX_CPC_FTL', 'IN_CPC_FTL', 'PA_CPC_FTL', 'GA_CPC_FTL'])
+    df_InputData = df_InputData.drop(columns=['WA_CPC_PTL', 'NV_CPC_PTL', 'NE_CPC_PTL', 'TX_CPC_PTL', 'IN_CPC_PTL', 'PA_CPC_PTL', 'GA_CPC_PTL'])
+    df_InputData = df_InputData.drop(columns=['WA_CPC_LTL', 'NV_CPC_LTL', 'NE_CPC_LTL', 'TX_CPC_LTL', 'IN_CPC_LTL', 'PA_CPC_LTL', 'GA_CPC_LTL'])
+    df_InputData = df_InputData.drop(columns=['WA_CPC_SP', 'NV_CPC_SP', 'NE_CPC_SP', 'TX_CPC_SP', 'IN_CPC_SP', 'PA_CPC_SP', 'GA_CPC_SP'])
+    df_InputData = df_InputData.drop(columns=['WA_LTL_CubeCovered',     'NV_LTL_CubeCovered',   'NE_LTL_CubeCovered',   'TX_LTL_CubeCovered',   'IN_LTL_CubeCovered',   'PA_LTL_CubeCovered',   'GA_LTL_CubeCovered'])
+    df_InputData = df_InputData.drop(columns=['WA_20PTL_CubeCovered',   'NV_20PTL_CubeCovered', 'NE_20PTL_CubeCovered', 'TX_20PTL_CubeCovered', 'IN_20PTL_CubeCovered', 'PA_20PTL_CubeCovered', 'GA_20PTL_CubeCovered'])
+    df_InputData = df_InputData.drop(columns=['WA_40FTL_CubeCovered',   'NV_40FTL_CubeCovered', 'NE_40FTL_CubeCovered', 'TX_40FTL_CubeCovered', 'IN_40FTL_CubeCovered', 'PA_40FTL_CubeCovered', 'GA_40FTL_CubeCovered'])
+
+#Generate Output Table
+    #session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.ER_ordering_sim_FreightCost')
+    
+#Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter(col("SUPPLIERID") == '175');
+
+###################
+    #Add OB Ship Cost Below
+###################   
+
+#Gather Cost per Cube Data
+    Add_OB = """     
+    With FIFOCOST as (
+        Select Fifo.* from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE Fifo
+        INNER JOIN (Select ITEMID, max(DM_UPDATEDON) as MaxDate from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE GROUP BY ITEMID) as MaxDate on MaxDate.MaxDate = Fifo.DM_UPDATEDON AND MaxDate.ITEMID = Fifo.ITEMID
+        --Where ITEMID = 243726
+    )
+    
+    , NonIBOpt as (
+            Select 
+                sim.ITEMID,
+                sim.SUPPLIERID,
+                sim.FC,
+                sim.FC as FC_CODE,
+                sim.ORDERTYPE,
+                sim.OTF,
+                sim.LT,
+                sim.CAP_DOS,
+                sim.ITERATION_COUNT,
+                sim.RFP_ITERATION_COUNT,
+                sim.CAP_ORDERQTY_USED as Output_Original,
+                FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OriginalCost,
+                0 as FC_Limited,
+                0 as Redistribution_Qty,
+                sim.CAP_ORDERQTY_USED as Output_Redistributed,
+                FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_RedistributedCost,
+                sim.CASEQUANTITY,
+                prod.ITEMCUBE,
+                FIFOCOST.FIFOAVERAGECOST,
+                0 as Item_Constraint_Used,
+                NULL as Item_MOQMOV_Type,
+                0 as Redistribution_Qty_ItemMOQ,
+                0 as Constraint_Total_Applicable,
+                0 as Roundup_ItemMOQ,
+                sim.CAP_ORDERQTY_USED as Output_OrderQty_ItemMOQ,
+                FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OrderCost_ItemMOQ,
+                'Round' as Case_RoundType,
+                (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundQty,
+                FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundCost,
+                NULL as Item_Pallet_Type,
+                1 as Item_Pallet_Constraint,
+                0 as Item_Pallet_TotalRound,
+                (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletQty,
+                FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletCost,
+                'None' as Brand_MOV_Type,
+                0 as Brand_MOV_Used,
+                0 as MOV_RoundUnits,
+                0 as MOV_ReqRoundAdd_Pallet,
+                (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVQty,
+                FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVCost,
+                sim."Last Modified"
+            from inventorysandbox.dbo.RFP_ordering_sim sim
+            LEFT JOIN inventorysandbox.dbo.RFP_IB_optimization IBOpt on IBOpt.itemid = sim.itemid AND IBOpt.fc = sim.fc AND 
+                IBOpt.rfp_iteration_count = sim.rfp_iteration_count AND IBOPT.ordertype = sim.ordertype AND IBOPT.otf = sim.otf AND IBOPT.lt = sim.lt
+            LEFT JOIN FIFOCOST on FIFOCOST.itemid = sim.itemid
+            LEFT JOIN lakehouse.spreedw_dim.product prod on prod.itemid = sim.itemid
+            INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = sim.rfp_iteration_count
+            WHERE IBOpt.ITEMID IS NULL
+    )
+    
+    , IBOPTSETUP as (
+            Select Opt.* from inventorysandbox.dbo.RFP_IB_optimization Opt INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = Opt.rfp_iteration_count
+            UNION
+            Select * from NonIBOpt
+    )  
+    
+    , Adjusted_Output as (
+        Select Output.*,
+        GREATEST(Output."Output_BrandMOVQty", 0) as Unit_Used
+        FROM IBOPTSETUP Output
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) MaxCount
+        WHERE MAX_COUNT = Output.RFP_ITERATION_COUNT
+        --AND Output.SUPPLIERID = 1326 AND Output.OTF = 21 AND Output.LT = 21
+        )
+        
+        ,Total_Units as (
+        Select
+            SUPPLIERID,
+            ORDERTYPE,
+            OTF,
+            LT,
+            CAP_DOS,
+            ITERATION_COUNT,
+            SUM(GREATEST(valid.Unit_Used, 0)) as Total_Units
+        from Adjusted_Output valid
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT prod on prod.ITEMID = valid.itemid
+        --WHERE valid.SUPPLIERID = 1326 --AND valid.OTF = 21 AND valid.LT = 21
+        GROUP BY SUPPLIERID, ORDERTYPE, OTF, LT, CAP_DOS, ITERATION_COUNT
+        )
+        
+        , AddCostBreakdown as (
+        Select
+            valid.ITEMID,
+            valid.SUPPLIERID,
+            valid.ORDERTYPE,
+            valid.OTF,
+            valid.LT,
+            valid.CAP_DOS,
+            valid.ITERATION_COUNT,
+            AddCostPerUnit.FC_COMBO,
+            least(ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)), 151) as Item_Weight_Cat,
+            AVG(AddCostPerUnit.ADD_CPU) * SUM(valid.Unit_Used) as ADD_Cost_OBShip
+        from Adjusted_Output valid
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT prod on prod.ITEMID = valid.itemid
+        LEFT JOIN Total_Units on Total_Units.SUPPLIERID = valid.supplierid AND Total_Units.ORDERTYPE = valid.ordertype AND Total_Units.OTF = valid.OTF AND Total_Units.LT = valid.LT AND Total_Units.CAP_DOS = valid.cap_dos
+        LEFT JOIN INVENTORYSANDBOX.DBO.ER_TEMP_ADD_CPU_20240804 AddCostPerUnit on AddCostPerUnit.ITEM_WEIGHT_CAT = least(ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)), 151)
+        --WHERE valid.SUPPLIERID = 1326 --AND valid.OTF = 21 AND valid.LT = 21
+        GROUP BY valid.ITEMID, valid.SUPPLIERID, valid.ORDERTYPE, valid.OTF, valid.LT, valid.CAP_DOS, least(ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)), 151), valid.ITERATION_COUNT, AddCostPerUnit.FC_COMBO
+        )
+        
+        Select
+            SUPPLIERID,
+            CASE WHEN ORDERTYPE = 'Domestic' THEN 'domestic' WHEN ORDERTYPE = 'Import' THEN 'import' ELSE ORDERTYPE END as ORDERTYPE,
+            OTF,
+            LT,
+            CAP_DOS,
+            ITERATION_COUNT,
+            TRIM(FC_COMBO) as FC_COMBO_OPTION,
+            SUM(ADD_Cost_OBShip) as Scenario_Add_Cost_OBShip
+        FROM AddCostBreakdown
+        -- WHERE SUPPLIERID = 386 --AND OTF = 21 AND LT = 21
+        GROUP BY SUPPLIERID, ORDERTYPE, OTF, LT, CAP_DOS, FC_COMBO, ITERATION_COUNT
+    """
+    df_Add_OB = session.sql(Add_OB)
+    df_Add_OB = df_Add_OB.to_pandas()
+
+    df_InputData['FC_COMBO_ORDERED'] = df_InputData['FC_COMBO_ORDERED'].str.strip()
+    df_InputData = pd.merge(df_InputData, df_Add_OB, how='left', on=['SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'FC_COMBO_OPTION'])
+
+
+###################
+    #OOS Lost Sales Below
+###################   
+
+#Gather OOS Lost Margin Data
+    OOS_Lost = """     
+        With FIFOCOST as (
+            Select Fifo.* from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE Fifo
+            INNER JOIN (Select ITEMID, max(DM_UPDATEDON) as MaxDate from LAKEHOUSE.FINANCE_COSTING.FIFOCACHE GROUP BY ITEMID) as MaxDate on MaxDate.MaxDate = Fifo.DM_UPDATEDON AND MaxDate.ITEMID = Fifo.ITEMID
+            -- Where Fifo.ITEMID = 322932
+        )
+        
+        , NonIBOpt as (
+                Select 
+                    sim.ITEMID,
+                    sim.SUPPLIERID,
+                    sim.FC,
+                    sim.FC as FC_CODE,
+                    sim.ORDERTYPE,
+                    sim.OTF,
+                    sim.LT,
+                    sim.CAP_DOS,
+                    sim.ITERATION_COUNT,
+                    sim.RFP_ITERATION_COUNT,
+                    sim.CAP_ORDERQTY_USED as Output_Original,
+                    FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OriginalCost,
+                    0 as FC_Limited,
+                    0 as Redistribution_Qty,
+                    sim.CAP_ORDERQTY_USED as Output_Redistributed,
+                    FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_RedistributedCost,
+                    sim.CASEQUANTITY,
+                    prod.ITEMCUBE,
+                    FIFOCOST.FIFOAVERAGECOST,
+                    0 as Item_Constraint_Used,
+                    NULL as Item_MOQMOV_Type,
+                    0 as Redistribution_Qty_ItemMOQ,
+                    0 as Constraint_Total_Applicable,
+                    0 as Roundup_ItemMOQ,
+                    sim.CAP_ORDERQTY_USED as Output_OrderQty_ItemMOQ,
+                    FIFOCOST.FIFOAVERAGECOST * sim.CAP_ORDERQTY_USED as Output_OrderCost_ItemMOQ,
+                    'Round' as Case_RoundType,
+                    (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundQty,
+                    FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_CaseRoundCost,
+                    NULL as Item_Pallet_Type,
+                    1 as Item_Pallet_Constraint,
+                    0 as Item_Pallet_TotalRound,
+                    (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletQty,
+                    FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_ItemPalletCost,
+                    'None' as Brand_MOV_Type,
+                    0 as Brand_MOV_Used,
+                    0 as MOV_RoundUnits,
+                    0 as MOV_ReqRoundAdd_Pallet,
+                    (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVQty,
+                    FIFOCOST.FIFOAVERAGECOST * (ROUND(sim.CAP_ORDERQTY_USED / greatest(1, sim.CASEQUANTITY), 0) * sim.CASEQUANTITY) as Output_BrandMOVCost,
+                    sim."Last Modified"
+                from inventorysandbox.dbo.RFP_ordering_sim sim
+                LEFT JOIN inventorysandbox.dbo.RFP_IB_optimization IBOpt on IBOpt.itemid = sim.itemid AND IBOpt.fc = sim.fc AND 
+                    IBOpt.rfp_iteration_count = sim.rfp_iteration_count AND IBOPT.ordertype = sim.ordertype AND IBOPT.otf = sim.otf AND IBOPT.lt = sim.lt
+                LEFT JOIN FIFOCOST on FIFOCOST.itemid = sim.itemid
+                LEFT JOIN lakehouse.spreedw_dim.product prod on prod.itemid = sim.itemid
+                INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = sim.rfp_iteration_count
+                WHERE IBOpt.ITEMID IS NULL
+                -- AND sim.SUPPLIERID = 1787
+        )
+        
+        , IBOPTSETUP as (
+                Select Opt.* from inventorysandbox.dbo.RFP_IB_optimization Opt INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) ITERATION on ITERATION.MAX_COUNT = Opt.rfp_iteration_count
+                UNION
+                Select * from NonIBOpt
+        )  
+    
+               --Need to update to be accurate margin! 8/4/2024
+        , Total_Cost as (
+        Select
+            SUPPLIERID,
+            ORDERTYPE,
+            OTF,
+            LT,
+            CAP_DOS,
+            ITERATION_COUNT,
+            SUM(valid."Output_BrandMOVCost") as Total_Cost
+        from IBOPTSETUP valid
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT prod on prod.ITEMID = valid.itemid
+        --Where SUPPLIERID = 1326
+        GROUP BY SUPPLIERID, ORDERTYPE, OTF, LT, CAP_DOS, ITERATION_COUNT
+        )
+
+        , MAX_DATE as (
+        Select ITEMID, MAX(DM_CREATEDON) as MAX_DATE from lakehouse.businessanalytics_dbo.expectedvaluesellable GROUP BY ITEMID
+        )
+        
+        , ITEM_PROFIT as (
+        Select
+            Sell.ITEMID,
+            Sell.NETPROFIT$
+        FROM lakehouse.businessanalytics_dbo.expectedvaluesellable Sell
+        INNER JOIN MAX_DATE on MAX_DATE.MAX_DATE = Sell.DM_CREATEDON AND MAX_DATE.ITEMID = Sell.ITEMID
+        )
+        
+        , LostMarginBreakdown as (
+        Select
+            valid.SUPPLIERID,
+            valid.ORDERTYPE,
+            valid.OTF,
+            valid.LT,
+            valid.CAP_DOS,
+            valid.iteration_count,
+            CASE WHEN ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)) <= 50 THEN 0 WHEN ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)) <= 200 THEN 50 WHEN ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)) <= 9999 THEN 200 
+                    ELSE 200 END as Item_Cost_Cat_Min,
+            
+            CASE WHEN ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)) <= 50 THEN 50 WHEN ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)) <= 200 THEN 200 WHEN ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)) <= 9999 THEN 9999 
+                    ELSE 9999 END as Item_Cost_Cat_Max,
+            MAX(Total_Cost.Total_Cost) as Total_Cost,
+            SUM(GREATEST(0, valid."Output_BrandMOVCost")) as Output_BrandCubeCostTotal,
+            
+            SUM(GREATEST(0, valid."Output_BrandMOVQty") * LEAST(ITEM_PROFIT.NETPROFIT$, valid.fifoaveragecost * .5)) as Output_BrandCubeMarginTotal,
+            -- (SUM(GREATEST(0, valid."Output_BrandMOVCost")) / .55) * .18 as Output_BrandCubeMarginTotal,
+
+            CASE WHEN MAX(Total_Cost.Total_Cost) = 0 THEN 0 ELSE SUM(valid."Output_BrandMOVCost") / MAX(Total_Cost.Total_Cost) END as Cost_Percent
+        from IBOPTSETUP valid
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT prod on prod.ITEMID = valid.itemid
+        LEFT JOIN Total_Cost on Total_Cost.SUPPLIERID = valid.supplierid AND Total_Cost.ORDERTYPE = valid.ordertype AND Total_Cost.OTF = valid.OTF AND Total_Cost.LT = valid.LT AND Total_Cost.CAP_DOS = valid.cap_dos AND Total_Cost.ITERATION_COUNT = valid.iteration_count
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_ordering_sim) MaxCount
+        LEFT JOIN ITEM_PROFIT on ITEM_PROFIT.ITEMID = valid.itemid
+        WHERE MAX_COUNT = valid.RFP_ITERATION_COUNT
+        --AND valid.supplierid = 1326
+        GROUP BY valid.SUPPLIERID, valid.ORDERTYPE, valid.OTF, valid.LT, valid.CAP_DOS, ceil((prod.CASEWEIGHT / prod.CASEQUANTITY)), valid.iteration_count
+        )
+        
+        , TempOutput as (
+        Select
+            SUPPLIERID,
+            ORDERTYPE,
+            OTF,
+            LT,
+            CAP_DOS,
+            ITERATION_COUNT,
+            Item_Cost_Cat_Min,
+            Item_Cost_Cat_Max,
+            MAX(Output_BrandCubeMarginTotal) as Output_BrandCubeMarginTotal,
+            SUM(Cost_Percent) as Output_Cost_Percent,
+            SUM(Output_BrandCubeCostTotal) as NETWORK_TOTALCOST
+        FROM LostMarginBreakdown
+        --WHERE SUPPLIERID = 1326 AND ORDERTYPE = 'domestic' AND OTF = 28 AND LT = 14
+        GROUP BY SUPPLIERID, ORDERTYPE, OTF, LT, CAP_DOS, ITERATION_COUNT, Item_Cost_Cat_Min, Item_Cost_Cat_Max
+        )
+
+        , LostMarginSetup as (
+        Select
+            STOCKPOSITION_CURRENT as FC_COMBO,
+            MIN_ITEM_COST as ITEM_COST_CAT_MIN,
+            MAX_ITEM_COST as ITEM_COST_CAT_MAX,
+            CONVERSION_INCREASE_TO_MAX_FC as CONV_PERCENT,
+            1 / (CONVERSION_INCREASE_TO_MAX_FC + 1) as CONV_PERCENT_USED,
+            current_date() as LAST_MODIFIED
+        from DEMANDSANDBOX.TRANSFERS.CONVERSIONINCREASETOMAXFC
+        ORDER BY STOCKPOSITION_CURRENT, MIN_ITEM_COST
+        )
+
+
+        Select 
+            Temp.SUPPLIERID,
+            CASE WHEN ORDERTYPE = 'Domestic' THEN 'domestic' WHEN ORDERTYPE = 'Import' THEN 'import' ELSE ORDERTYPE END as ORDERTYPE,
+            OTF,
+            LT,
+            CAP_DOS,
+            ITERATION_COUNT,
+            LostMarginSales.FC_COMBO as FC_COMBO_OPTION,
+            MAX(NETWORK_TOTALCOST) as NETWORK_TOTALCOST,
+            SUM(Temp.Output_BrandCubeMarginTotal * (1- LostMarginSales.CONV_PERCENT_USED)) as Scenario_OOS_Lost_Margin
+        FROM TempOutput Temp
+        LEFT JOIN LostMarginSetup LostMarginSales 
+            on LostMarginSales.Item_Cost_Cat_Min = Temp.Item_Cost_Cat_Min AND LostMarginSales.ITEM_COST_CAT_MAX = Temp.ITEM_COST_CAT_MAX
+        -- WHERE SUPPLIERID = 1787
+        GROUP BY SUPPLIERID, ORDERTYPE, OTF, LT, CAP_DOS, ITERATION_COUNT, LostMarginSales.FC_COMBO
+    """
+    df_OOS_Lost = session.sql(OOS_Lost)
+    df_OOS_Lost = df_OOS_Lost.to_pandas()
+
+    df_InputData = pd.merge(df_InputData, df_OOS_Lost, how='left', on=['SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS', 'ITERATION_COUNT', 'FC_COMBO_OPTION'])
+
+#Transfer Cost
+
+#Carrying Cost
+    df_InputData['HOLDING_COST_ADD'] = ((df_InputData['OTF'] - 14) * df_InputData['NETWORK_TOTALCOST']) * .0011 #likely to divide by two, assumes that you are linear sell through
+    df_InputData['SCENARIO_ADD_COST_OBSHIP'].fillna(0, inplace=True)
+    df_InputData['NETWORK_TOTALCOST'].fillna(0, inplace=True)
+    df_InputData['SCENARIO_OOS_LOST_MARGIN'].fillna(0, inplace=True)
+    df_InputData['HOLDING_COST_ADD'].fillna(0, inplace=True)
+
+#Total Solution Cost
+    df_InputData['Total_SolCost'] = df_InputData['HOLDING_COST_ADD'] + df_InputData['SCENARIO_OOS_LOST_MARGIN'] + df_InputData['SCENARIO_ADD_COST_OBSHIP'] + df_InputData['Total_Freight_Cost']
+
+#Generate Output Table
+    iteration_count = df_InputData['RFP_ITERATION_COUNT'].iloc[0]
+
+    if iteration_count == 1:
+        session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_ProfitVariable')
+    else:
+        session.create_dataframe(df_InputData).write.mode("append").saveAsTable('inventorysandbox.dbo.RFP_ProfitVariable')
+
+    update_command = "ALTER WAREHOUSE INVENTORYMODEL_WH SET WAREHOUSE_SIZE = 'MEDIUM'"
+    session.sql(update_command).collect()
+        
+    # session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_ProfitVariable')
+
+#Call Following Step
+    #session.sql("CALL INVENTORYSANDBOX.DBO.AOG5_Test()").collect()
+
+#To View Speed
+    return(session.create_dataframe([1]))
+
+
+
+
+        #Optional - return output
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter((col("ORDERTYPE") == 'domestic') & (col("SUPPLIERID") == 183) & (col('FC_COMBO_OPTION') == 'GA IN NE NV PA TX WA'));
+
+
+
