@@ -1,11 +1,22 @@
+# UPDATE FROM TEST ING -> CHANGE ALL .TEST ING to .DBO
+# DIFFERENCES FROM DAILY:
+#     _Sim ulation to _Sim utliation_Daily
+# DIFFERENCES FROM CURRENT:
+#     _Current to _Simulation
+#   Ensure that SPREETAIL_WAREHOUSE.INVENTORY.PREDICTIVEQOH_DAILY_CURRENT is reverted back to Curr ent as needed
+#   Replace OTF Sim with:
+    # Select RFP.SUPPLIERID, RFP.ORDERTYPE, IFNULL(BRAND_LIST.UPDATED_ORDERTYPE, RFP.ORDERTYPE) as UPDATED_ORDERTYPE, RFP.OTF_TYPE, RFP.LT_TYPE, RFP.OTF - 7 as OTF, round(RFP.LT / 7, 0)* 7 as LT, RFP.CAP_DOS, 
+    #     RFP.CURRENT_DATE_USED, RFP.CURRENT_DATE_USED_SS 
+    # from inventorysandbox.DBO.ER_TEMP_OTF_RFP RFP
+    #     LEFT JOIN BRAND_LIST on BRAND_LIST.SUPPLIERID = RFP.supplierid AND BRAND_LIST.ORDERTYPE = RFP.ordertype
+    # WHERE RFP.LT_TYPE = 'BASE' AND RFP.OTF <= 70 --AND RFP.supplierid = 386 AND RFP.ordertype = 'domestic'
+
 #Python Code Created by: Erik R
-#Code Last Updated: 3/26/2025 @ 10:00am
+#Code Last Updated: 3/26/2025 @ 10:25am
 #Procedure Name: Step_1B_RFPGen_Simulation
 #Code Guide Avail Here:
 
 #To Do
-#9/27/2024 - Update the cap DoS logic
-#9/27/2024 - Add RFP Order PredictedQoH starting at T + 21
 
 #Update Notes:
 #10/10/2024 - Unique from iteration 1, OTF query and updated unmet
@@ -13,7 +24,9 @@
 #12/09/2024 - Updated logic to consolidate steps 1 and 3 together to remove the need for two worksheets and optimize the code run flow
 #12/30/2024 - Updated lead time to round to 7 days for testing; this is how AROB does it but not something we'd want to permanently change
 #01/01/2025 - Add annual FCST to output for calculation of SS seasonality
-#03/26/2025 - Updated the case pack rounding logic to be 1 only
+#03/12/2025 - Updated Pred QoH join to remove the procurement status filter as that was causing some slight issues
+#03/20/2025 - Updated the OTF add logic to sum up all previous OTF values and add that to the next lead time, minus 14
+#03/26/2025 - Updated the case pack rounding to be 1
 
 import snowflake.snowpark as snowpark
 from snowflake.snowpark.functions import (
@@ -32,51 +45,74 @@ def main(session: snowpark.Session):
     # Gather Key Data Points
     # Basic Item Data Query Source
     ItemData = """
-     WITH ITEM_LIST as (
-    SELECT * FROM inventorysandbox.dbo.RFP_Sim_ItemList WHERE ITEMID IS NOT NULL --AND ITEMID <> 'NULL' --AND SUPPLIERID <> 'NULL'
+WITH ITEM_LIST as (
+    SELECT * FROM inventorysandbox.DBO.RFP_Simulation_ItemList WHERE ITEMID IS NOT NULL --AND ITEMID <> 'NULL' --AND SUPPLIERID <> 'NULL'
+    )
+    , BRAND_LIST as (
+    SELECT DISTINCT SUPPLIERID, ORIGIN_STATE, ORDERTYPE, UPDATED_ORDERTYPE FROM inventorysandbox.DBO.RFP_Simulation_ItemList WHERE ITEMID IS NOT NULL --AND ITEMID <> 'NULL' --AND SUPPLIERID <> 'NULL'
+    )
+    , PREV_OTF as (
+    Select BRAND_LIST.SUPPLIERID, BRAND_LIST.ORDERTYPE, Dec.RFP_ITERATION_COUNT, MAX(Dec.OTF) - 7 as OTF_Add
+    FROM BRAND_LIST
+        LEFT JOIN inventorysandbox.DBO.RFP_Simulation_OrderDecision Dec on Dec.SUPPLIERID = BRAND_LIST.SUPPLIERID AND Dec.ORDERTYPE = BRAND_LIST.ORDERTYPE
+        LEFT JOIN inventorysandbox.DBO.RFP_Simulation_Process_Count
+        -- WHERE BRAND_LIST.SUPPLIERID = 175
+        GROUP BY BRAND_LIST.SUPPLIERID, BRAND_LIST.ORDERTYPE, Dec.RFP_ITERATION_COUNT
+    )
+
+    , TOTAL_PREV_OTF as (
+    Select SUPPLIERID, ORDERTYPE, SUM(OTF_ADD) as OTF_ADD FROM PREV_OTF GROUP BY SUPPLIERID, ORDERTYPE
     )
     
     , OTF_ADD as (
-      Select sim.SUPPLIERID, sim.ORDERTYPE, CASE WHEN MAX("Iteration") = 1 THEN 1 ELSE Dec.RFP_ITERATION_COUNT END as RFP_ITERATION_COUNT, CASE WHEN MAX("Iteration") = 1 THEN 0 ELSE MAX(Dec.OTF) - 14 END as OTF_Add
-        FROM inventorysandbox.dbo.ER_TEMP_OTF_RFP sim
-        LEFT JOIN inventorysandbox.dbo.RFP_OrderDecision Dec on Dec.SUPPLIERID = sim.SUPPLIERID AND Dec.ORDERTYPE = sim.ORDERTYPE
-        LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
-        WHERE sim.OTF < 77 --AND sim.SUPPLIERID <> 'NULL'
-        GROUP BY sim.SUPPLIERID, sim.ORDERTYPE, Dec.RFP_ITERATION_COUNT
+    Select BRAND_LIST.SUPPLIERID, BRAND_LIST.ORDERTYPE, CASE WHEN MAX("Iteration") = 1 THEN 1 ELSE MAX(Dec.RFP_ITERATION_COUNT) END as RFP_ITERATION_COUNT, 
+        CASE WHEN MAX("Iteration") = 1 THEN 0 ELSE MIN(OTF_ADD) END as OTF_Add
+    FROM BRAND_LIST
+        LEFT JOIN inventorysandbox.DBO.RFP_Simulation_OrderDecision Dec on Dec.SUPPLIERID = BRAND_LIST.SUPPLIERID AND Dec.ORDERTYPE = BRAND_LIST.ORDERTYPE
+        LEFT JOIN inventorysandbox.DBO.RFP_Simulation_Process_Count
+        LEFT JOIN TOTAL_PREV_OTF on TOTAL_PREV_OTF.SUPPLIERID = BRAND_LIST.SUPPLIERID AND TOTAL_PREV_OTF.ORDERTYPE = BRAND_LIST.ORDERTYPE
+        -- WHERE BRAND_LIST.SUPPLIERID = 175
+        GROUP BY BRAND_LIST.SUPPLIERID, BRAND_LIST.ORDERTYPE
     )
     
     , TOTAL_OTF_ADD as (
         Select SUPPLIERID, ORDERTYPE, SUM(OTF_Add) as Total_Add
         FROM OTF_ADD
+        --WHERE SUPPLIERID = 386
         GROUP BY SUPPLIERID, ORDERTYPE
     )
 
     , OTF_SIM_SETUP as (
-    Select * from inventorysandbox.dbo.ER_TEMP_OTF_RFP WHERE OTF < 77 --AND SUPPLIERID <> 'NULL'
+    Select RFP.SUPPLIERID, RFP.ORDERTYPE, IFNULL(BRAND_LIST.UPDATED_ORDERTYPE, RFP.ORDERTYPE) as UPDATED_ORDERTYPE, RFP.OTF_TYPE, RFP.LT_TYPE, RFP.OTF - 7 as OTF, round(RFP.LT / 7, 0)* 7 as LT, RFP.CAP_DOS, 
+        RFP.CURRENT_DATE_USED, RFP.CURRENT_DATE_USED_SS 
+    from inventorysandbox.DBO.ER_TEMP_OTF_RFP RFP
+        LEFT JOIN BRAND_LIST on BRAND_LIST.SUPPLIERID = RFP.supplierid AND BRAND_LIST.ORDERTYPE = RFP.ordertype
+    WHERE RFP.LT_TYPE = 'BASE' AND RFP.OTF <= 70 --AND RFP.supplierid = 386 AND RFP.ordertype = 'domestic'
     )
 
     , OTF_LT_Values as (
     SELECT 
         OTF.SUPPLIERID,
         OTF.ORDERTYPE,
+        OTF.UPDATED_ORDERTYPE,
         OTF.OTF_TYPE,
         OTF.LT_TYPE,
         OTF.CURRENT_DATE_USED,
         OTF.CURRENT_DATE_USED_SS,
-        CASE WHEN "Iteration" = 1 THEN 0 ELSE ((OTF.OTF + (dec.OTF - 14)) - dec.OTF) / 7 END as ITERATION_COUNT,
-        OTF.OTF - 7 as OTF,
+        IFNULL(CASE WHEN "Iteration" = 1 THEN 0 ELSE ((OTF.OTF + (dec.OTF - 14)) - dec.OTF) / 7 END, MAXCOUNT.MAX_RFP_ITERATION_COUNT + 1) as ITERATION_COUNT,
+        OTF.OTF,
         (round(greatest(1, OTF.LT / 7), 0) * 7) + Total_Add as LT,
-        CASE WHEN "Iteration" = 1 THEN 0 ELSE dec.RFP_ITERATION_COUNT END as RFP_ITERATION_COUNT
+        CASE WHEN "Iteration" = 1 THEN 0 ELSE MAXCOUNT.MAX_RFP_ITERATION_COUNT END as RFP_ITERATION_COUNT
     FROM OTF_SIM_SETUP OTF
-    LEFT JOIN (Select MAX(ITERATION_COUNT) as MAX_ITERATION_COUNT FROM inventorysandbox.dbo.RFP_IB_optimization) MAXCOUNT
+    LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_RFP_ITERATION_COUNT FROM inventorysandbox.DBO.RFP_Simulation_IB_optimization) MAXCOUNT
     LEFT JOIN (Select SUPPLIERID, ORDERTYPE, max(OTF) as OTF, max(LT) as LT, MAX(RFP_ITERATION_COUNT) as RFP_ITERATION_COUNT 
-            FROM inventorysandbox.dbo.RFP_OrderDecision 
-            LEFT JOIN (Select max(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_OrderDecision) as MAXCOUNT
+            FROM inventorysandbox.DBO.RFP_Simulation_OrderDecision 
+            LEFT JOIN (Select max(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.DBO.RFP_Simulation_OrderDecision) as MAXCOUNT
             WHERE RFP_ITERATION_COUNT = MAX_COUNT
             GROUP BY SUPPLIERID, ORDERTYPE) dec on dec.SUPPLIERID = OTF.SUPPLIERID AND dec.ORDERTYPE = OTF.ORDERTYPE
     LEFT JOIN TOTAL_OTF_ADD ADD on ADD.SUPPLIERID = OTF.SUPPLIERID AND ADD.ORDERTYPE = OTF.ORDERTYPE
-    LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
-    WHERE (OTF.OTF + (round(greatest(1, OTF.LT / 7), 0) * 7) + IFNULL(Total_Add, 365)) <= 360
+    LEFT JOIN inventorysandbox.DBO.RFP_Simulation_Process_Count
+    WHERE (OTF.OTF + 14 + (round(greatest(1, OTF.LT / 7), 0) * 7) + IFNULL(Total_Add, 365)) < 360
     -- AND OTF.SUPPLIERID = 386
     )
 
@@ -84,13 +120,13 @@ def main(session: snowpark.Session):
     SELECT his.ITEMID, his.STATE AS FC, DATEVALUE, DAYSFROMTODAY, NODEQOH, 
            his.TOTALRECEIPT AS QOO, FORECAST, FINAL_FORECAST_USED, 
            UNMETDEMAND, ENDING_PREDICTIVEQOH as ENDING_PREDICTEDQOH
-    FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT his
+    FROM SPREETAIL_WAREHOUSE.INVENTORY.PREDICTIVEQOH_DAILY_CURRENT his
     LEFT JOIN lakehouse.spreedw_dim.product prod ON prod.itemid = his.itemid
-    WHERE prod.PROCUREMENTSTATUS = 'Replenish' 
-      AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish' 
-      AND his.datevalue <= (current_date() + 365)
+    -- WHERE prod.PROCUREMENTSTATUS = 'Replenish' 
+    --   AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish' 
+      WHERE his.datevalue <= (current_date() + 365)
       -- AND prod.ITEMID <> 'NULL' 
-      -- AND prod.ITEMID = 183880
+      -- AND prod.ITEMID = 231622
       -- AND prod.SUPPLIERID = 368
     )
 
@@ -100,7 +136,7 @@ def main(session: snowpark.Session):
         STATE,
         SUM(FORECAST) as ANNUAL_DEMAND,
         SUM(TOTALRECEIPT) as ANNUAL_TOTALRECEIPT
-    FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT
+    FROM SPREETAIL_WAREHOUSE.INVENTORY.PREDICTIVEQOH_DAILY_CURRENT
     WHERE datevalue <= (current_date() + 365)
     -- AND ITEMID = 324324
     GROUP BY ITEMID, STATE
@@ -110,6 +146,7 @@ def main(session: snowpark.Session):
     ITEM_LIST.ITEMID,
     ITEM_LIST.SUPPLIERID,
     OTF_LT_Values.ORDERTYPE,
+    OTF_LT_Values.UPDATED_ORDERTYPE,
     OTF_LT_Values.OTF,
     OTF_LT_Values.LT,
     OTF_LT_Values.LT_TYPE,
@@ -137,7 +174,7 @@ def main(session: snowpark.Session):
     ANNUAL_DEMAND.ANNUAL_TOTALRECEIPT
     
     FROM ITEM_LIST
-    INNER JOIN OTF_LT_Values on OTF_LT_Values.SUPPLIERID = ITEM_LIST.SUPPLIERID
+    INNER JOIN OTF_LT_Values on OTF_LT_Values.SUPPLIERID = ITEM_LIST.SUPPLIERID AND OTF_LT_Values.UPDATED_ORDERTYPE = ITEM_LIST.UPDATED_ORDERTYPE
     INNER JOIN PRED_QOH on try_cast(PRED_QOH.ITEMID as int) = try_cast(ITEM_LIST.ITEMID as int)
     LEFT JOIN ANNUAL_DEMAND on ANNUAL_DEMAND.ITEMID = ITEM_LIST.ITEMID AND ANNUAL_DEMAND.STATE = PRED_QOH.FC
     INNER JOIN (With Setup as (Select ITEMID, INVENTORYSTATUS, CASE WHEN INVENTORYSTATUS = 'Import - Domestic Available' THEN 'Y' WHEN INVENTORYSTATUS like '%Import%' THEN 'Y' ELSE 'N' END as IMPORT_ITEM, 
@@ -145,19 +182,22 @@ def main(session: snowpark.Session):
                 from lakehouse.spreedw_dim.product) Select ITEMID, CASE WHEN (IMPORT_ITEM = 'N' AND DOMESTIC_ITEM = 'N') THEN 'domestic' WHEN IMPORT_ITEM = 'Y' THEN 'import' ELSE 'domestic' END as ORDERTYPE FROM Setup
                 ) IMP_DOM_STATUS on IMP_DOM_STATUS.ITEMID = ITEM_LIST.ITEMID AND IMP_DOM_STATUS.ORDERTYPE = OTF_LT_Values.ORDERTYPE
     WHERE PRED_QOH.DATEVALUE <= (OTF_LT_Values.LT + OTF_LT_Values.OTF + current_date + 21)
+    -- AND ITEM_LIST.ITEMID = 23280
     """
     df_ItemData = session.sql(ItemData)#.filter(col("ITEMID") == '81495')
-    # return df_ItemData.filter((col("OTF") == 14) & (col("ORDERTYPE") == 'domestic'))
 
     # Generate Lead Time Values (Total & After LT)
     df_ItemPred = df_ItemData.withColumn('FINAL_FORECAST_USED', col('FINAL_FORECAST_USED').cast('double'))
 
+# #Return Output Temp
+    # df_ItemPred.write.mode("overwrite").saveAsTable("inventorysandbox.DBO.RFP_Simulation_ordering_sim_TempOutput")
+
 #Add Updated Unmet Demand - Only Required for Iteration 2+
     RFP_PredQoH = """
-    Select DISTINCT ITEMID, DATEVALUE, FC, ORDERTYPE, UPDATED_UNMET, "Iteration"
-    from inventorysandbox.dbo.RFP_PredictedQoHV2
-        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.dbo.RFP_PredictedQoHV2) MAXCOUNT
-        LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
+    Select ITEMID, DATEVALUE, FC, ORDERTYPE, UPDATED_UNMET, "Iteration"
+    from inventorysandbox.DBO.RFP_Simulation_PredictedQoHV2
+        LEFT JOIN (Select MAX(RFP_ITERATION_COUNT) as MAX_COUNT FROM inventorysandbox.DBO.RFP_Simulation_PredictedQoHV2) MAXCOUNT
+        LEFT JOIN inventorysandbox.DBO.RFP_Simulation_Process_Count
     WHERE RFP_ITERATION_COUNT = MAX_COUNT
                    """
     df_RFP_PredQoH = session.sql(RFP_PredQoH)
@@ -167,14 +207,17 @@ def main(session: snowpark.Session):
     df_ItemPred = df_ItemPred.drop('UPDATED_UNMET')
     del df_RFP_PredQoH
 
-    # return df_ItemPred.filter((col("OTF") == 14) & (col("ORDERTYPE") == 'domestic'))
+#Return Output Temp
+    # df_ItemPred.write.mode("overwrite").saveAsTable("inventorysandbox.DBO.RFP_Simulation_ordering_sim_TempOutput")
+    # Select * from inventorysandbox.DBO.RFP_Simulation_ordering_sim_TempOutput
+
     # Extra Required Columns using Window Functions
-    w = Window.partitionBy('ITEMID', 'FC', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    w = Window.partitionBy('ITEMID', 'FC', 'UPDATED_ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
     df_ItemPred = df_ItemPred.withColumn('FC_QoH', sum_(col('NODEQOH')).over(w)
         ).withColumn('FC_FCST', col('ANNUAL_DEMAND')
         ).withColumn('FC_QOO', col('ANNUAL_TOTALRECEIPT'))
 
-    w_net_fcst = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    w_net_fcst = Window.partitionBy('ITEMID', 'UPDATED_ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
     df_ItemPred = df_ItemPred.withColumn('NET_FCST', sum_(col('FORECAST')).over(w_net_fcst)
         ).drop('NODEQOH', 'QOO', 'ANNUAL_TOTALRECEIPT', 'ANNUAL_DEMAND')
 
@@ -187,20 +230,18 @@ def main(session: snowpark.Session):
     df_ItemPred = df_ItemPred.withColumn('OTF_FCST', sum_(when((col('DATEVALUE') <= col('OTF_Date')) & (col('DATEVALUE') > col('LT_Date')), col('FORECAST')).otherwise(0)).over(w)
         ).withColumn('OTF_Final_FCST', sum_(when((col('DATEVALUE') <= col('OTF_Date')) & (col('DATEVALUE') > col('LT_Date')), col('FINAL_FORECAST_USED')).otherwise(0)).over(w))
 
-    # return df_ItemPred
-
     # Join predicted QoH for OTF time period
     df_OTFPredQoH = session.sql("""
     With PreSetup as (
-            Select ITEMID, state as FC, DATEVALUE FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT WHERE DAYSFROMTODAY <= 365
+            Select ITEMID, state as FC, DATEVALUE FROM SPREETAIL_WAREHOUSE.INVENTORY.PREDICTIVEQOH_DAILY_CURRENT WHERE DAYSFROMTODAY <= 365
         )
     
         ,V1_Setup as (
-            Select ITEMID, FC, DATEVALUE, ORDERTYPE, PREDICTEDQOH FROM inventorysandbox.dbo.RFP_ordering_predQoH
+            Select ITEMID, FC, DATEVALUE, ORDERTYPE, PREDICTEDQOH FROM inventorysandbox.DBO.RFP_Simulation_ordering_predQoH
         )
         
         ,V2_Setup as (
-            SELECT ITEMID, FC, DATEVALUE, ORDERTYPE, PREDICTEDQOH FROM inventorysandbox.dbo.RFP_PredictedQoHV2
+            SELECT ITEMID, FC, DATEVALUE, ORDERTYPE, PREDICTEDQOH FROM inventorysandbox.DBO.RFP_Simulation_PredictedQoHV2
         )
         
         ,Final_Setup as (
@@ -217,7 +258,7 @@ def main(session: snowpark.Session):
         -- LEFT JOIN V2_Setup V2Import on V2Import.ITEMID = PreSetup.ITEMID AND V2Import.FC = PreSetup.FC AND V2Import.DATEVALUE = PreSetup.DATEVALUE AND V2Import.ORDERTYPE = 'import'
 
         
-        LEFT JOIN inventorysandbox.dbo.RFP_Sim_Process_Count
+        LEFT JOIN inventorysandbox.DBO.RFP_Simulation_Process_Count
         
         )
         
@@ -232,11 +273,14 @@ def main(session: snowpark.Session):
         WHERE ITEMID IS NOT NULL AND ORDERTYPE IS NOT NULL --AND ITEMID = 397885
         -- GROUP BY ITEMID, FC, DATEVALUE, ORDERTYPE
     """)
+#Second the need, huge value like SEA. Data location is key but for me the data insights 'required' are limited but I have many wants
+#No order decision is changed
+#Inventory Model allows for the order management
     df_ItemPred = df_ItemPred.join(df_OTFPredQoH, on=['ITEMID', 'FC', 'DATEVALUE', 'ORDERTYPE'], how='left')
 
     # OTF Unmet
-    w2 = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE', 'DATEVALUE')
-    w3 = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    w2 = Window.partitionBy('ITEMID', 'UPDATED_ORDERTYPE', 'OTF_TYPE', 'LT_TYPE', 'DATEVALUE')
+    w3 = Window.partitionBy('ITEMID', 'UPDATED_ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
     
     df_ItemPred = df_ItemPred.with_column('PREDICTEDQOH', coalesce(col('PREDICTEDQOH'), col('ENDING_PREDICTEDQOH')))
     df_ItemPred = df_ItemPred.withColumn('OTF_Unmet_Setup', greatest(col('FORECAST') - col('PREDICTEDQOH'), lit(0))
@@ -254,7 +298,7 @@ def main(session: snowpark.Session):
     df_ItemPred = df_ItemPred.withColumn('SS_FCST', sum_(when((col('DATEVALUE') >= col('Cap_Date')) & (col('DATEVALUE') < col('SafetyStock_Date')), col('FORECAST')).otherwise(0)).over(w))
 
     # Minimum Order Qty to Cover Network OOS
-    w_min = Window.partitionBy('ITEMID', 'DATEVALUE', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    w_min = Window.partitionBy('ITEMID', 'DATEVALUE', 'UPDATED_ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
     df_ItemPred = df_ItemPred.withColumn('Net_QoH_Min', sum_(col('PREDICTEDQOH')).over(w_min)
         ).withColumn('Net_QoH_Min', when((col('DATEVALUE') <= col('Cap_Date')) & (col('DATEVALUE') > col('LT_Date')), col('Net_QoH_Min')).otherwise(lit(999))
         ).withColumn('Min_OTF_Req', max_(when(col('Net_QoH_Min') == 0, col('UNMETDEMAND')).otherwise(lit(0))).over(w))
@@ -291,7 +335,7 @@ def main(session: snowpark.Session):
     df_ItemPred = df_ItemPred.withColumn('BaselineOrderQty', col('CASEQUANTITY_NZ') * snow_round((col('SafetyStock_Ordered') + col('OTF_Unmet')) / col('CASEQUANTITY_NZ')))
 
     # Max QoH Over OTF & Cap On Hand Used
-    w_item = Window.partitionBy('ITEMID', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
+    w_item = Window.partitionBy('ITEMID', 'UPDATED_ORDERTYPE', 'OTF_TYPE', 'LT_TYPE')
     df_ItemPred = df_ItemPred.withColumn('Net_CAP', sum_(col('CAP_FCST')).over(w_item) + sum_(col('SafetyStock')).over(w_item)
         ).withColumn('Net_MaxQoHOTF', max_(col('Max_QoH_OTF')).over(w_item)
         ).withColumn('Net_BaselineOrderQty', sum_(col('BaselineOrderQty')).over(w_item))
@@ -315,7 +359,7 @@ def main(session: snowpark.Session):
     ).drop('MAX_ITERATION_COUNT'
     ).withColumn('RFP_ITERATION_COUNT', col('RFP_ITERATION_COUNT') + 1
     ).drop('LT_Date', 'OTF_Date', 'Cap_Date', 'SafetyStock_Date'
-    ).select('ITEMID', 'FC', 'DATEVALUE', 'ORDERTYPE', 'OTF_TYPE', 'LT_TYPE', 'SUPPLIERID', 'OTF', 'LT', 'CAP_DOS', 'CASEQUANTITY', 'PROCUREMENTSTATUS', 'CURRENTSUPPLIERPROCUREMENTSTATUS', 'DAYSFROMTODAY', 'FORECAST', 'UNMETDEMAND', 
+    ).select('ITEMID', 'FC', 'DATEVALUE', 'ORDERTYPE', 'UPDATED_ORDERTYPE', 'OTF_TYPE', 'LT_TYPE', 'SUPPLIERID', 'OTF', 'LT', 'CAP_DOS', 'CASEQUANTITY', 'PROCUREMENTSTATUS', 'CURRENTSUPPLIERPROCUREMENTSTATUS', 'DAYSFROMTODAY', 'FORECAST', 'UNMETDEMAND', 
              'ENDING_PREDICTEDQOH', 'FINAL_FORECAST_USED', 'FC_QOH', 'FC_FCST', 'FC_QOO', 'NET_FCST', 'LT_UNMET', 'LT_FCST', 'LT_FINAL_FCST', 'QOH_AFTER_LT', 'PREDICTEDQOH', 'NETWORK_QOH', 'MAX_QOH_OTF', 'OTF_UNMET', 'OTF_FCST', 'OTF_FINAL_FCST', 
              'QOH_AFTER_OTF', 'CAP_FCST', 'SS_FCST', 'MIN_OTF_REQ', 'MAX_LT', 'SAFETYSTOCK_BASELINE', 'SAFETYSTOCK_ADJUSTMENT', 'SAFETYSTOCK', 'ZERO', 'SAFETYSTOCK_ORDERED', 'CASEQUANTITY_NZ', 
              'BASELINEORDERQTY', 'NET_CAP', 'NET_MAXQOHOTF', 'NET_BASELINEORDERQTY', 'CAP_ORDERQTYV1', 'CAP_ORDERQTYV2', 'CAP_ORDERQTY_USED', 'Last Modified', 'ITERATION_COUNT', 'RFP_ITERATION_COUNT')
@@ -325,22 +369,22 @@ def main(session: snowpark.Session):
     iteration_count = df_ItemPred.select("RFP_ITERATION_COUNT").collect()[0][0]
 
     if iteration_count == 1:
-        df_ItemPred.write.mode("overwrite").saveAsTable("inventorysandbox.dbo.RFP_ordering_sim")
+        df_ItemPred.write.mode("overwrite").saveAsTable("inventorysandbox.DBO.RFP_Simulation_ordering_sim")
     else:
-        df_ItemPred.write.mode("append").saveAsTable("inventorysandbox.dbo.RFP_ordering_sim")
+        df_ItemPred.write.mode("append").saveAsTable("inventorysandbox.DBO.RFP_Simulation_ordering_sim")
 
     # # # Adjust Warehouse Size
     session.sql("ALTER WAREHOUSE IBOPTIMIZATION_WH SET WAREHOUSE_SIZE = 'XSMALL'").collect()
     
     
-    # df_ItemPred.write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_ordering_sim_Temp20241215')
+    # df_ItemPred.write.mode("overwrite").saveAsTable('inventorysandbox.DBO.RFP_Simulation_ordering_sim_Temp20241215')
     # # # return df_ItemPred
 
     # # #Call Following Step
-    # # # session.sql("CALL INVENTORYSANDBOX.DBO.AOG2_Test()").collect()
+    # # # session.sql("CALL inventorysandbox.DBO.AOG2_Test()").collect()
     
     # # #To View Speed
-    return(session.create_dataframe([1]))
+    return 1
 
     # null_counts = df_ItemPred.select([(count(col(column).isNull()).alias(f"{column}_null_count")) for column in df_ItemPred.columns])
     # return null_counts
