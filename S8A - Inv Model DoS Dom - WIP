@@ -1,0 +1,117 @@
+#Python Code Created by: Erik R
+#Code Last Updated: 10/28/2024
+#Procedure Name: Step_8A_RFPGen_Simulation
+#Code Guide Avail Here: 
+
+#Update Notes:
+#10/28/24 - Done - Initial development of code 
+
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.functions import (
+    col, sum as sum_, max as max_, min as min_, avg, count, lit, col,
+    when, greatest, least, coalesce, date_add, to_date, current_date, row_number,
+    round as snow_round, current_timestamp, abs
+)
+from snowflake.snowpark.window import Window
+from datetime import datetime
+
+def main(session: snowpark.Session):
+
+    # Adjust Warehouse Size
+    #session.sql("ALTER WAREHOUSE IBOPTIMIZATION_WH SET WAREHOUSE_SIZE = 'XLARGE'").collect()
+
+    # Gather Key Data Points
+    # Basic Item Data Query Source
+    ItemData = """
+        Select
+            ITEMID,
+            SUPPLIERID,
+            ORDERTYPE,
+            OTF,
+            LT,
+            SUM("Output_FreightOptQty") as Output_FreightOptQty
+        FROM INVENTORYSANDBOX.DBO.RFP_Simulation_OrderDecision Output
+        WHERE ORDERTYPE = 'domestic'
+        --AND ITEMID = 255178
+        GROUP BY ITEMID, SUPPLIERID, ORDERTYPE, OTF, LT
+    """
+    df_ItemData = session.sql(ItemData)#.filter(col("ITEMID") == '81495')
+
+    PredQoH = """
+        Select
+            ITEMID,
+            DAYSFROMTODAY,
+            SUM(NODEQOH) as NODEQOH,
+            SUM(TOTALRECEIPT) as TOTALRECEIPT,
+            SUM(FORECAST) as FORECAST,
+            SUM(ENDING_PREDICTIVEQOH) as ENDING_PREDICTIVEQOH
+        from inventorysandbox.dbo.RFP_InventoryModelDomestic
+        INNER JOIN (Select MAX(GENERATEDON) as MAXDATE from inventorysandbox.dbo.RFP_InventoryModelDomestic) MAXJOIN on MAXJOIN.MAXDATE = inventorysandbox.dbo.RFP_InventoryModelDomestic.GENERATEDON
+        --WHERE ITEMID = 255178
+        GROUP BY ITEMID, DAYSFROMTODAY
+    """
+    df_PredQoH = session.sql(PredQoH)#.filter(col("ITEMID") == '81495')
+
+    #df_ItemData = df_ItemData.withColumn("DATEVALUE", date_add(current_date(), df_ItemData["LT"]))
+    df_ItemData = df_ItemData.withColumn("ORDER_LAND_DATE", date_add(current_date(), df_ItemData["LT"])
+                                        ).withColumn('DAYSFROMTODAY', col('LT')
+                                        )
+
+    df_PredQoH = df_PredQoH.join(df_ItemData, on=['ITEMID', 'DAYSFROMTODAY'], how='left')
+
+        #Cumulative Unmet Demand Post Order Land Date
+    # Define the window specification with partitioning by ITEMID and FC, and ordering by DATEVALUE
+    window_spec = Window.partitionBy(col('ITEMID')).orderBy(col('DAYSFROMTODAY')).rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    
+    # Calculate the cumulative sum of UNMETDEMAND within each ITEMID and FC
+    df_PredQoH = df_PredQoH.withColumn('CUMULATIVE_SUM_FORECAST', sum_(col('FORECAST')).over(window_spec))
+
+    # Compute TARGET_VALUE for each row
+    df_PredQoH = df_PredQoH.withColumn('TARGET_VALUE', col('CUMULATIVE_SUM_FORECAST') + col('ENDING_PREDICTIVEQOH'))
+
+    # Create aliases for self-join
+    df_current = df_PredQoH.alias('df_current')
+    df_future = df_PredQoH.alias('df_future')
+
+    # Perform self-join to find future DAYSFROMTODAY where CUMULATIVE_SUM_FORECAST >= TARGET_VALUE
+    joined_df = df_current.join(
+        df_future,
+        (df_current['ITEMID'] == df_future['ITEMID']) &
+        (df_future['DAYSFROMTODAY'] >= df_current['DAYSFROMTODAY']),
+        how='inner'
+    ).filter(
+        df_future['CUMULATIVE_SUM_FORECAST'] >= df_current['TARGET_VALUE']
+    )
+
+    # Aggregate to find the minimum RUN_OUT_DAYS for each ITEMID and DAYSFROMTODAY
+    from snowflake.snowpark.functions import min as snow_min
+    grouped_df = joined_df.groupBy(
+        df_current['ITEMID'],
+        df_current['DAYSFROMTODAY'],
+        df_current['CUMULATIVE_SUM_FORECAST'],
+        df_current['ENDING_PREDICTIVEQOH'],
+        df_current['TARGET_VALUE']
+    ).agg(
+        snow_min(df_future['DAYSFROMTODAY']).alias('RUN_OUT_DAYS')
+    )
+
+    grouped_df = grouped_df.withColumnRenamed('ITEMIDDF_CURRENT', 'ITEMID')
+    grouped_df = grouped_df.withColumnRenamed('DAYSFROMTODAYDF_CURRENT', 'DAYSFROMTODAY')
+    grouped_df = grouped_df.select('ITEMID', 'DAYSFROMTODAY', 'RUN_OUT_DAYS')
+    
+    # Optionally, join back to the original dataframe to get all columns
+    final_df = df_PredQoH.join(grouped_df, on=['ITEMID', 'DAYSFROMTODAY'], how='left')
+    del grouped_df
+    del joined_df
+    del df_current
+    del df_future
+
+    final_df = final_df.withColumn('DAYSOFSUPPLY', col('RUN_OUT_DAYS') - col('DAYSFROMTODAY'))
+    final_df = final_df.withColumnRenamed('OUTPUT_FREIGHTOPTQTY', 'DOM_ORDERQTY')
+
+    final_df = final_df.select('ITEMID', 'DAYSFROMTODAY', 'OTF', 'LT', 'NODEQOH', 'TOTALRECEIPT', 'DOM_ORDERQTY', 'FORECAST', 'ENDING_PREDICTIVEQOH', 'DAYSOFSUPPLY')
+
+
+    final_df.write.mode("overwrite").save_as_table('inventorysandbox.dbo.RFP_InventoryModelDomestic_DOS')
+
+    return(session.create_dataframe([1]))
