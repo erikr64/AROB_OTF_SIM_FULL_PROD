@@ -1,0 +1,807 @@
+-- Reach out to Justin to get specific WH to run this job, be snowpark and auto suspend after use
+--Query Summary Guide Available here: https://vminnovations.sharepoint.com/:w:/s/inventoryoperations/EVOTBpiEvUdJvFkrN3s4pBoBjryoYBMZLY_05atBHUIH0w?e=s4iOC8
+--Procedure Name: AOG6B_Test
+--Developer: Erik R/John R
+--Validation: 
+--Last Updated: 11/8/2024 by Erik R
+
+-- show tasks;
+--Alter task AOG6B_Test resume;
+-- execute task AOG6A_Test;
+
+
+create or replace task Step_5B_RFPGen_Simulation
+    warehouse = INVENTORYMODEL_WH
+    as begin
+    
+create or replace temp table fc_states as (
+        select distinct
+            w.state,
+            w.originid,
+            wh.warehouseid
+        from lakehouse.forecast_oracle.warehouse as w
+            left join (select * from lakehouse.m2_dbo.inventory_warehouses where shortname like '%01%') as wh on wh.overrideorigin = w.originid
+        where w.state not in ('CA', 'AZ')
+        );
+
+-----------(Step 8) Calculate Date Measures, Summarize Previous Inputs, Cumulative forecast, On Order Values (Directly Pulls from Steps 4B, 5B, 6B, 7)-------------
+--Updated on 5/15/2024 to use baseline forecast value vs grade adjusted--
+create or replace temp table Cumulative_Calc as (
+        SELECT 
+            his.ITEMID, 
+            his.originid,
+            DATEVALUE, 
+            DAYSFROMTODAY,
+            FORECAST,
+            NODEQOH as node_qoh, 
+            his.TOTALRECEIPT + IFNULL(IMP_ORDERQTY, 0) as total_receipt, --IFNULL(IMP_ORDERQTY, 0)
+            FORECAST as baseline_forecast
+        FROM spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_CURRENT his
+            LEFT JOIN lakehouse.spreedw_dim.product prod ON prod.itemid = his.itemid
+            LEFT JOIN (SELECT ITEMID, FC, LT, 
+                            SUM(CASE WHEN ORDERTYPE = 'domestic' THEN "Output_FreightOptQty" ELSE 0 END) AS DOM_ORDERQTY, 
+                            SUM(CASE WHEN ORDERTYPE = 'import' THEN "Output_FreightOptQty" ELSE 0 END) AS IMP_ORDERQTY
+                            FROM inventorysandbox.dbo.RFP_OrderDecision RFP WHERE ORDERTYPE = 'import' GROUP BY ITEMID, FC, LT) ORDERQTY on ORDERQTY.ITEMID = his.ITEMID AND ORDERQTY.FC = his.STATE AND ORDERQTY.LT = his.daysfromtoday
+            INNER JOIN (Select DISTINCT ITEMID, FC from inventorysandbox.dbo.RFP_OrderDecision DEC INNER JOIN (Select MAX(RFP_ITERATION_COUNT) MAX_COUNT 
+                            FROM inventorysandbox.dbo.RFP_OrderDecision WHERE ORDERTYPE = 'import'
+                            ) MAXCOUNT on MAXCOUNT.MAX_COUNT = DEC.RFP_ITERATION_COUNT WHERE ORDERTYPE = 'import') Item_List on Item_List.ITEMID = his.itemid AND Item_List.FC = his.state
+                            
+            INNER JOIN (Select DISTINCT ITEMID, FC, ORDERTYPE, least((MAX(OTF) + MAX(LT) + MAX(OTF)), 385) as MAXDATE  from inventorysandbox.dbo.RFP_OrderDecision Dec INNER JOIN (Select MAX(RFP_ITERATION_COUNT) as MAXCOUNT 
+                            FROM inventorysandbox.dbo.RFP_OrderDecision) MAXENTRY on MAXENTRY.MAXCOUNT = Dec.RFP_ITERATION_COUNT WHERE (OTF + LT + OTF) < 390  GROUP BY ITEMID, FC, ORDERTYPE
+                            ) DatasetFilter ON DatasetFilter.ITEMID = his.itemid AND DatasetFilter.FC = his.state AND DatasetFilter.ORDERTYPE = 'import'
+            INNER JOIN inventorysandbox.dbo.RFP_Sim_ItemList on inventorysandbox.dbo.RFP_Sim_ItemList.ITEMID = his.ITEMID
+        WHERE prod.PROCUREMENTSTATUS = 'Replenish' 
+          AND prod.CURRENTSUPPLIERPROCUREMENTSTATUS = 'Replenish' 
+          AND his.daysfromtoday <= MAXDATE
+          -- AND prod.SUPPLIERID = 4318 
+          -- AND prod.ITEMID = 294254
+          -- AND prod.ITEMID >= 280000
+          -- AND prod.ITEMID = 235772
+        );
+
+--Temp tables not dropped: Cumulative_Calc (Step 8)
+
+--Adjust WH Size 
+alter warehouse INVENTORYMODEL_WH set warehouse_size = large;   
+
+---------------(Step 9A) Critical Step that Generates Predictive QoH given Forecast, On Order and Original QoH-------------
+create or replace temp table recursive_predictive as (
+        with recursive_predictive as (-- base case
+            select 
+                itemid,
+                originid,
+                daysfromtoday,
+                node_qoh,
+                total_receipt,
+                baseline_forecast as forecast,
+                forecast as gradeadj_forecast,
+                cast(greatest(0, node_qoh - baseline_forecast) + total_receipt as float) as predictive_qoh
+            from cumulative_calc
+            where daysfromtoday = 0
+             -- and 1=0
+            
+            union all
+            
+            -- recursive part
+            select 
+                c.itemid, 
+                c.originid,
+                c.daysfromtoday,
+                c.node_qoh, 
+                c.total_receipt,
+                c.baseline_forecast as forecast,
+                c.forecast as gradeadj_forecast,
+                cast(
+                    case 
+                        when r.predictive_qoh <= 0
+                        then greatest(0, r.predictive_qoh + c.total_receipt) 
+                        else greatest(0, r.predictive_qoh - c.baseline_forecast) + c.total_receipt
+            		    end as float
+                    ) as predictive_qoh
+            from cumulative_calc c
+            	join recursive_predictive r on c.itemid = r.itemid and c.originid = r.originid and c.daysfromtoday = r.daysfromtoday + 1 and c.daysfromtoday <= 732)
+        
+        select *
+        from recursive_predictive);
+
+        
+-------------(Step 9B) Generate Unmet Demand for each FC, Week Given Predictive QoH from Previous Step-------------
+create or replace temp table unmet_output as (
+        select 
+        	r.*,
+            s.state,
+        	case when forecast - (ifnull(lag(r.predictive_qoh, 1) over (partition by r.itemid, r.originid order by r.daysfromtoday), r.node_qoh)) <= 0 then 0
+        		else forecast - (ifnull(lag(predictive_qoh, 1) over (partition by r.itemid, r.originid order by r.daysfromtoday), r.node_qoh)) end as unmet_demand,
+        	ifnull(lag(r.predictive_qoh, 1) over (partition by r.itemid, r.originid order by r.daysfromtoday), node_qoh) as predictive_qoh_lag1
+        from recursive_predictive as r
+        inner join fc_states as s on s.originid = r.originid
+            );
+
+-------------(Redistribution Output --Added 7/24/24
+create or replace temp table RedistTable as (
+        Select
+        	FC_Combo,
+        	Coverage_FC,
+        	IFNULL(MAX(CASE WHEN OOS_FC = 'WA' THEN Coverage_Percent ELSE NULL END), 0) as WA_Covered,
+        	IFNULL(MAX(CASE WHEN OOS_FC = 'NV' THEN Coverage_Percent ELSE NULL END), 0) as NV_Covered,
+        	IFNULL(MAX(CASE WHEN OOS_FC = 'NE' THEN Coverage_Percent ELSE NULL END), 0) as NE_Covered,
+        	IFNULL(MAX(CASE WHEN OOS_FC = 'TX' THEN Coverage_Percent ELSE NULL END), 0) as TX_Covered,
+        	IFNULL(MAX(CASE WHEN OOS_FC = 'IN' THEN Coverage_Percent ELSE NULL END), 0) as IN_Covered,
+        	IFNULL(MAX(CASE WHEN OOS_FC = 'PA' THEN Coverage_Percent ELSE NULL END), 0) as PA_Covered,
+        	IFNULL(MAX(CASE WHEN OOS_FC = 'GA' THEN Coverage_Percent ELSE NULL END), 0) as GA_Covered
+        from INVENTORYSANDBOX.DBO.ER_TEMP_OOSREDISTRIBUTION_20240724
+        Group by FC_Combo, Coverage_FC
+        );
+
+--Generate FC Combo List --Added 7/24/24
+create or replace temp table FC_ComboList_V1 as (
+        Select
+        	Unmet_Output.*,
+        	CASE WHEN GA_Data.Unmet_Demand = 0 THEN 'GA ' ELSE '' END || CASE WHEN IN_Data.Unmet_Demand = 0 THEN 'IN ' ELSE '' END || CASE WHEN NE_Data.Unmet_Demand = 0 THEN 'NE ' ELSE '' END ||
+        		CASE WHEN NV_Data.Unmet_Demand = 0 THEN 'NV ' ELSE '' END || CASE WHEN PA_Data.Unmet_Demand = 0 THEN 'PA ' ELSE '' END || CASE WHEN TX_Data.Unmet_Demand = 0 THEN 'TX ' ELSE '' END || CASE WHEN WA_Data.Unmet_Demand = 0 THEN 'WA ' ELSE '' END as FC_Combo,
+        	WA_Data.Unmet_Demand as WA_Unmet, NV_Data.Unmet_Demand as NV_Unmet, NE_Data.Unmet_Demand as NE_Unmet, TX_Data.Unmet_Demand as TX_Unmet,
+        	IN_Data.Unmet_Demand as IN_Unmet, PA_Data.Unmet_Demand as PA_Unmet, GA_Data.Unmet_Demand as GA_Unmet
+        FROM Unmet_Output
+        	LEFT JOIN (Select ItemID, daysfromtoday, Unmet_Demand, Predictive_QoH_Lag1 from Unmet_Output Where State = 'WA') WA_Data on WA_Data.ItemID = Unmet_Output.ItemID AND WA_Data.daysfromtoday = Unmet_Output.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, Unmet_Demand, Predictive_QoH_Lag1 from Unmet_Output Where State = 'NV') NV_Data on NV_Data.ItemID = Unmet_Output.ItemID AND NV_Data.daysfromtoday = Unmet_Output.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, Unmet_Demand, Predictive_QoH_Lag1 from Unmet_Output Where State = 'NE') NE_Data on NE_Data.ItemID = Unmet_Output.ItemID AND NE_Data.daysfromtoday = Unmet_Output.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, Unmet_Demand, Predictive_QoH_Lag1 from Unmet_Output Where State = 'TX') TX_Data on TX_Data.ItemID = Unmet_Output.ItemID AND TX_Data.daysfromtoday = Unmet_Output.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, Unmet_Demand, Predictive_QoH_Lag1 from Unmet_Output Where State = 'IN') IN_Data on IN_Data.ItemID = Unmet_Output.ItemID AND IN_Data.daysfromtoday = Unmet_Output.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, Unmet_Demand, Predictive_QoH_Lag1 from Unmet_Output Where State = 'PA') PA_Data on PA_Data.ItemID = Unmet_Output.ItemID AND PA_Data.daysfromtoday = Unmet_Output.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, Unmet_Demand, Predictive_QoH_Lag1 from Unmet_Output Where State = 'GA') GA_Data on GA_Data.ItemID = Unmet_Output.ItemID AND GA_Data.daysfromtoday = Unmet_Output.daysfromtoday
+        );
+
+--Determine Demand that needs to be redistributed, apply based on baseline redistribution %  --Added 7/24/24
+create or replace temp table Redistribution as (
+        Select
+        	Combo.ItemID,
+            Combo.OriginID,
+        	Combo.daysfromtoday,
+        	Combo.Node_QoH,
+        	Combo.Total_Receipt,
+        	Combo.Forecast,
+        	Combo.GradeAdj_Forecast,
+        	Combo.Unmet_Demand,
+        	Combo.Predictive_QoH,
+        	Combo.Predictive_QoH_Lag1,
+        	IFNULL(Combo.WA_Unmet * WA_Covered, 0) + IFNULL(Combo.NV_Unmet * NV_Covered, 0) + IFNULL(Combo.NE_Unmet * NE_Covered, 0) + IFNULL(Combo.TX_Unmet * TX_Covered, 0)
+        		+ IFNULL(Combo.IN_Unmet * IN_Covered, 0) + IFNULL(Combo.PA_Unmet * PA_Covered, 0) + IFNULL(Combo.GA_Unmet * GA_Covered, 0) as Add_DemandV1,
+        	IFNULL(Combo.WA_Unmet * WA_Covered, 0) WA_CoveredV1,
+        	IFNULL(Combo.NV_Unmet * NV_Covered, 0) NV_CoveredV1,
+        	IFNULL(Combo.NE_Unmet * NE_Covered, 0) NE_CoveredV1,
+        	IFNULL(Combo.TX_Unmet * TX_Covered, 0) TX_CoveredV1,
+        	IFNULL(Combo.IN_Unmet * IN_Covered, 0) IN_CoveredV1,
+        	IFNULL(Combo.PA_Unmet * PA_Covered, 0) PA_CoveredV1,
+        	IFNULL(Combo.GA_Unmet * GA_Covered, 0) GA_CoveredV1
+        FROM FC_ComboList_V1 Combo
+        	LEFT JOIN RedistTable Redist on TRIM(Redist.FC_Combo) = TRIM(Combo.FC_Combo) AND TRIM(Redist.Coverage_FC) = TRIM(Combo.State));
+        
+drop table if exists Redistribution_Final;
+
+--Cap at QoH and Calculate Final Demand Value  --Added 7/24/24
+create or replace temp table Redistribution_Final as (
+        Select
+        	Redistribution.*,
+        	least(Redistribution.Add_DemandV1 + Redistribution.Forecast, Redistribution.Predictive_QoH_Lag1) as Final_Forecast_PredQoHOnly
+        FROM Redistribution);
+
+-----------------Drop previous tables-------------
+drop table if exists Cumulative_Calc;
+drop table if exists Unmet_Output;
+drop table if exists FC_ComboList_V1;
+drop table if exists Redistribution;
+----Temp tables not dropped: Redistribution_Final
+
+-------------(Step 11A) Generate secondary predictive QoH using new demand with OOS adjustment applied-------------
+create or replace temp table Recursive_Predictive_V2 as (
+        WITH Recursive_Predictive_V2 AS (-- Base Case
+            SELECT 
+                Red.ItemID, Red.OriginID, daysfromtoday, Red.Add_DemandV1, Unmet_Demand as Original_Unmet, GradeAdj_Forecast,
+            	WA_CoveredV1, NV_CoveredV1, NE_CoveredV1, TX_CoveredV1, IN_CoveredV1, PA_CoveredV1, GA_CoveredV1,
+                Node_QoH, Total_Receipt, Final_Forecast_PredQoHOnly, Red.Forecast as Original_Forecast, Red.Predictive_QoH as Original_Predictive_QOH,
+                CAST(GREATEST(0, Node_QoH - Final_Forecast_PredQoHOnly) + Total_Receipt AS FLOAT) AS Predictive_QoH_V2
+            FROM Redistribution_Final Red
+            WHERE daysfromtoday = 0
+            
+            UNION ALL
+            
+            -- Recursive Part
+            SELECT 
+                Red.ItemID, Red.OriginID, Red.daysfromtoday, Red.Add_DemandV1, Unmet_Demand as Original_Unmet, Red.GradeAdj_Forecast,
+            	Red.WA_CoveredV1, Red.NV_CoveredV1, Red.NE_CoveredV1, Red.TX_CoveredV1, Red.IN_CoveredV1, Red.PA_CoveredV1, Red.GA_CoveredV1,
+                Red.Node_QoH, Red.Total_Receipt, Red.Final_Forecast_PredQoHOnly, Red.Forecast as Original_Forecast, Red.Predictive_QoH as Original_Predictive_QOH,
+                CAST(CASE WHEN r.Predictive_QoH_V2 <= 0 THEN GREATEST(0, r.Predictive_QoH_V2 + Red.Total_Receipt) ELSE GREATEST(0, r.Predictive_QoH_V2 - Red.Final_Forecast_PredQoHOnly) + Red.Total_Receipt END AS FLOAT) AS Predictive_QoH_V2
+            FROM Redistribution_Final Red
+            	JOIN Recursive_Predictive_V2 r ON Red.ItemID = r.ItemID AND Red.OriginID = r.OriginID AND Red.daysfromtoday = r.daysfromtoday + 1 and red.daysfromtoday <= 732)
+        
+        Select * from Recursive_Predictive_V2);
+
+-------------(Step 11B) Generate Unmet Demand for each FC, Week Given Predictive QoH from Previous Step, Second version after Adjustment % for FC OOS-------------
+--Added on 12/14/2023 Predictive QoH Lag 1 as output to be used in the redistribution logic--
+create or replace temp table Unmet_Output_V2 as (
+        select 
+        	recursive_predictive_v2.*,
+            s.state,
+        	greatest(0, original_forecast - cast(ifnull(lag(predictive_qoh_v2, 1) over (partition by itemid, recursive_predictive_v2.originid order by daysfromtoday), node_qoh) as float)) as unmet_demand_v2,
+        	cast(ifnull(lag(predictive_qoh_v2, 1) over (partition by itemid, recursive_predictive_v2.originid order by daysfromtoday), node_qoh) as float) as predictive_qoh_v2_lag1
+        from recursive_predictive_v2
+        inner join fc_states as s on s.originid = recursive_predictive_v2.originid
+        );
+
+---------------Drop previous tables-------------
+drop table if exists Redistribution_Final;
+
+-----------------Generate FC Combo List --Added 7/24/24
+create or replace temp table FC_ComboList_V2 as (
+        Select
+        	Unmet_Output_V2.*,
+        
+        --Added 7/31/24 at 4pm to remove FCs if fully covered with demand and add demand
+        	CASE WHEN GA_Data.Predictive_QoH_V2_Lag1 > GA_Data.Final_Forecast_PredQoHOnly THEN 'GA ' ELSE '' END 
+                || CASE WHEN IN_Data.Predictive_QoH_V2_Lag1 > IN_Data.Final_Forecast_PredQoHOnly THEN 'IN ' ELSE '' END 
+                || CASE WHEN NE_Data.Predictive_QoH_V2_Lag1 > NE_Data.Final_Forecast_PredQoHOnly THEN 'NE ' ELSE '' END 
+                || CASE WHEN NV_Data.Predictive_QoH_V2_Lag1 > NV_Data.Final_Forecast_PredQoHOnly THEN 'NV ' ELSE '' END 
+                || CASE WHEN PA_Data.Predictive_QoH_V2_Lag1 > PA_Data.Final_Forecast_PredQoHOnly THEN 'PA ' ELSE '' END 
+                || CASE WHEN TX_Data.Predictive_QoH_V2_Lag1 > TX_Data.Final_Forecast_PredQoHOnly THEN 'TX ' ELSE '' END 
+                || CASE WHEN WA_Data.Predictive_QoH_V2_Lag1 > WA_Data.Final_Forecast_PredQoHOnly THEN 'WA ' ELSE '' END as FC_Combo,
+        
+        --Added 7/31/24 to remove add demand covered by previous step from unmet demand
+        	CASE WHEN Unmet_Output_V2.Add_DemandV1 = 0 THEN 1 ELSE greatest(0, least(1, (Unmet_Output_V2.Predictive_QoH_V2_Lag1 - Unmet_Output_V2.Original_Forecast) / Unmet_Output_V2.Add_DemandV1)) END as Covered_MultiplierV1,
+        
+        	WA_Data.Unmet_Demand as WA_Unmet, NV_Data.Unmet_Demand as NV_Unmet, NE_Data.Unmet_Demand as NE_Unmet, TX_Data.Unmet_Demand as TX_Unmet,
+        	IN_Data.Unmet_Demand as IN_Unmet, PA_Data.Unmet_Demand as PA_Unmet, GA_Data.Unmet_Demand as GA_Unmet
+        FROM Unmet_Output_V2
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V2) as Unmet_Demand, Predictive_QoH_V2_Lag1, Final_Forecast_PredQoHOnly from Unmet_Output_V2 Where State = 'WA') WA_Data on WA_Data.ItemID = Unmet_Output_V2.ItemID AND WA_Data.daysfromtoday = Unmet_Output_V2.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V2) as Unmet_Demand, Predictive_QoH_V2_Lag1, Final_Forecast_PredQoHOnly from Unmet_Output_V2 Where State = 'NV') NV_Data on NV_Data.ItemID = Unmet_Output_V2.ItemID AND NV_Data.daysfromtoday = Unmet_Output_V2.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V2) as Unmet_Demand, Predictive_QoH_V2_Lag1, Final_Forecast_PredQoHOnly from Unmet_Output_V2 Where State = 'NE') NE_Data on NE_Data.ItemID = Unmet_Output_V2.ItemID AND NE_Data.daysfromtoday = Unmet_Output_V2.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V2) as Unmet_Demand, Predictive_QoH_V2_Lag1, Final_Forecast_PredQoHOnly from Unmet_Output_V2 Where State = 'TX') TX_Data on TX_Data.ItemID = Unmet_Output_V2.ItemID AND TX_Data.daysfromtoday = Unmet_Output_V2.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V2) as Unmet_Demand, Predictive_QoH_V2_Lag1, Final_Forecast_PredQoHOnly from Unmet_Output_V2 Where State = 'IN') IN_Data on IN_Data.ItemID = Unmet_Output_V2.ItemID AND IN_Data.daysfromtoday = Unmet_Output_V2.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V2) as Unmet_Demand, Predictive_QoH_V2_Lag1, Final_Forecast_PredQoHOnly from Unmet_Output_V2 Where State = 'PA') PA_Data on PA_Data.ItemID = Unmet_Output_V2.ItemID AND PA_Data.daysfromtoday = Unmet_Output_V2.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V2) as Unmet_Demand, Predictive_QoH_V2_Lag1, Final_Forecast_PredQoHOnly from Unmet_Output_V2 Where State = 'GA') GA_Data on GA_Data.ItemID = Unmet_Output_V2.ItemID AND GA_Data.daysfromtoday = Unmet_Output_V2.daysfromtoday);
+
+--Calculate Total FC coverage to remove from Unmet to redistribute --Added 7/31/24
+create or replace temp table FC_AddCoverageV1 as (
+        Select
+        	ItemID,
+        	daysfromtoday,
+        	SUM(WA_CoveredV1 * Covered_MultiplierV1) as WA_CoveredV1,
+        	SUM(NV_CoveredV1 * Covered_MultiplierV1) as NV_CoveredV1,
+        	SUM(NE_CoveredV1 * Covered_MultiplierV1) as NE_CoveredV1,
+        	SUM(TX_CoveredV1 * Covered_MultiplierV1) as TX_CoveredV1,
+        	SUM(IN_CoveredV1 * Covered_MultiplierV1) as IN_CoveredV1,
+        	SUM(PA_CoveredV1 * Covered_MultiplierV1) as PA_CoveredV1,
+        	SUM(GA_CoveredV1 * Covered_MultiplierV1) as GA_CoveredV1
+        FROM FC_ComboList_V2
+        GROUP BY ItemID, daysfromtoday);
+
+--Determine Demand that needs to be redistributed, apply based on baseline redistribution %  --Added 7/24/24
+--Updated 7/31/2024 to remove previously covered unmet demand to not be double counted
+create or replace temp table RedistributionV2 as (
+        Select
+        	Combo.ItemID,
+        	Combo.OriginID,
+        	Combo.daysfromtoday,
+        	Combo.FC_Combo,
+        	Combo.Node_QoH,
+        	Combo.Total_Receipt,
+        	Combo.Original_Forecast,
+        	Combo.GradeAdj_Forecast,
+        	Combo.Final_Forecast_PredQoHOnly,
+        	Combo.Original_Unmet,
+        	Combo.Unmet_Demand_V2,
+        	Combo.Original_Predictive_QOH,
+        	Combo.Predictive_QoH_V2,
+        	Combo.Predictive_QoH_V2_Lag1,
+        	Combo.Covered_MultiplierV1,
+        	Combo.Add_DemandV1 * Combo.Covered_MultiplierV1 as Add_DemandV1,
+        	IFNULL((Combo.WA_Unmet - V1.WA_CoveredV1) * WA_Covered, 0) + IFNULL((Combo.NV_Unmet - V1.NV_CoveredV1) * NV_Covered, 0) + IFNULL((Combo.NE_Unmet - V1.NE_CoveredV1) * NE_Covered, 0) + IFNULL((Combo.TX_Unmet - V1.TX_CoveredV1) * TX_Covered, 0)
+        		+ IFNULL((Combo.IN_Unmet - V1.IN_CoveredV1) * IN_Covered, 0) + IFNULL((Combo.PA_Unmet - V1.PA_CoveredV1) * PA_Covered, 0) + IFNULL((Combo.GA_Unmet - V1.GA_CoveredV1) * GA_Covered, 0) as Add_DemandV2,
+        	
+        	Combo.WA_CoveredV1 * Covered_MultiplierV1 as WA_CoveredV1, Combo.NV_CoveredV1 * Covered_MultiplierV1 as NV_CoveredV1, Combo.NE_CoveredV1 * Covered_MultiplierV1 as NE_CoveredV1,
+        	Combo.TX_CoveredV1 * Covered_MultiplierV1 as TX_CoveredV1, Combo.IN_CoveredV1 * Covered_MultiplierV1 as IN_CoveredV1, Combo.PA_CoveredV1 * Covered_MultiplierV1 as PA_CoveredV1, Combo.GA_CoveredV1 * Covered_MultiplierV1 as GA_CoveredV1,
+        	IFNULL(greatest(0, Combo.WA_Unmet - V1.WA_CoveredV1) * WA_Covered, 0) WA_CoveredV2,
+        	IFNULL(greatest(0, Combo.NV_Unmet - V1.NV_CoveredV1) * NV_Covered, 0) NV_CoveredV2,
+        	IFNULL(greatest(0, Combo.NE_Unmet - V1.NE_CoveredV1) * NE_Covered, 0) NE_CoveredV2,
+        	IFNULL(greatest(0, Combo.TX_Unmet - V1.TX_CoveredV1) * TX_Covered, 0) TX_CoveredV2,
+        	IFNULL(greatest(0, Combo.IN_Unmet - V1.IN_CoveredV1) * IN_Covered, 0) IN_CoveredV2,
+        	IFNULL(greatest(0, Combo.PA_Unmet - V1.PA_CoveredV1) * PA_Covered, 0) PA_CoveredV2,
+        	IFNULL(greatest(0, Combo.GA_Unmet - V1.GA_CoveredV1) * GA_Covered, 0) GA_CoveredV2
+        FROM FC_ComboList_V2 Combo
+        	LEFT JOIN RedistTable Redist on TRIM(Redist.FC_Combo) = TRIM(Combo.FC_Combo) AND TRIM(Redist.Coverage_FC) = TRIM(Combo.State)
+        	LEFT JOIN FC_AddCoverageV1 V1 on V1.ItemID = Combo.ItemID AND V1.daysfromtoday = Combo.daysfromtoday);
+
+-----------------Drop previous tables-------------
+drop table if exists FC_AddCoverageV1;
+
+--Cap at QoH and Calculate Final Demand Value  --Added 7/24/24
+create or replace temp table Redistribution_V2_Final as (
+        Select
+        	RedistributionV2.*,
+        	least(RedistributionV2.Add_DemandV2 + RedistributionV2.Final_Forecast_PredQoHOnly, RedistributionV2.Predictive_QoH_V2_Lag1) as Final_Forecast_PredQoHOnly_V2
+        FROM RedistributionV2);
+
+-------------------Drop previous tables-------------
+drop table if exists Unmet_Output_V2;
+drop table if exists FC_ComboList_V2;
+drop table if exists RedistributionV2;
+
+-------------(Step 13A) Generate secondary predictive QoH using new demand with adjustment % applied-------------
+create or replace temp table recursive_predictive_v3 as (
+        with recursive_predictive_v3 as (-- base case
+            select 
+                red.itemid, red.originid, daysfromtoday, red.add_demandv1, red.add_demandv2, original_unmet, unmet_demand_v2, gradeadj_forecast,
+            	wa_coveredv1, nv_coveredv1, ne_coveredv1, tx_coveredv1, in_coveredv1, pa_coveredv1, ga_coveredv1, wa_coveredv2, nv_coveredv2, ne_coveredv2, tx_coveredv2, in_coveredv2, pa_coveredv2, ga_coveredv2,
+                node_qoh, total_receipt, final_forecast_predqohonly_v2, red.original_forecast, red.original_predictive_qoh, red.predictive_qoh_v2, red.covered_multiplierv1,
+                cast(greatest(0, node_qoh - final_forecast_predqohonly_v2) + total_receipt as float) as predictive_qoh_v3
+            from redistribution_v2_final red
+            where daysfromtoday = 0
+            
+            union all
+            
+            -- recursive part
+            select 
+                red.itemid, red.originid, red.daysfromtoday, red.add_demandv1, red.add_demandv2, red.original_unmet, red.unmet_demand_v2, red.gradeadj_forecast,
+            	red.wa_coveredv1, red.nv_coveredv1, red.ne_coveredv1, red.tx_coveredv1, red.in_coveredv1, red.pa_coveredv1, red.ga_coveredv1, red.wa_coveredv2, red.nv_coveredv2, red.ne_coveredv2, red.tx_coveredv2, red.in_coveredv2, red.pa_coveredv2, red.ga_coveredv2,
+                red.node_qoh, red.total_receipt, red.final_forecast_predqohonly_v2, red.original_forecast, red.original_predictive_qoh, red.predictive_qoh_v2, red.covered_multiplierv1,
+                cast(case when r.predictive_qoh_v3 <= 0 then greatest(0, r.predictive_qoh_v3 + red.total_receipt) else greatest(0, r.predictive_qoh_v3 - red.final_forecast_predqohonly_v2) + red.total_receipt end as float) as predictive_qoh_v3
+            from redistribution_v2_final red
+                join recursive_predictive_v3 r on red.itemid = r.itemid and red.originid = r.originid and red.daysfromtoday = r.daysfromtoday + 1 and red.daysfromtoday <= 732)
+            
+        select * from recursive_predictive_v3);
+
+
+-------------(Step 13B) Generate Unmet Demand for each FC, Week Given Predictive QoH from Previous Step, Second version after Adjustment % for FC OOS-------------
+--Added on 12/14/2023 Predictive QoH Lag 1 as output to be used in the redistribution logic--
+create or replace temp table Unmet_Output_V3 as (
+        Select 
+        	recursive_predictive_v3.*,
+            s.state,
+        	greatest(0, original_forecast - cast(ifnull(lag(predictive_qoh_v3, 1) over (partition by itemid, recursive_predictive_v3.originid order by daysfromtoday), node_qoh) as float)) as unmet_demand_v3,
+        	cast(ifnull(lag(predictive_qoh_v3, 1) over (partition by itemid, recursive_predictive_v3.originid order by daysfromtoday), node_qoh) as float) as predictive_qoh_v3_lag1,
+        from recursive_predictive_v3
+        inner join fc_states as s on s.originid = recursive_predictive_v3.originid
+        );
+
+---------------Drop previous tables-------------
+drop table if exists Redistribution_Final;
+
+--Generate FC Combo List --Added 7/24/24
+create or replace temp table FC_ComboList_V3 as (
+        Select
+        	Unmet_Output_V3.*,
+        --Added 7/31/24 at 4pm to remove FCs if fully covered with demand and add demand
+        	CASE WHEN GA_Data.Predictive_QoH_V3_Lag1 > GA_Data.Final_Forecast_PredQoHOnly_V2 THEN 'GA ' ELSE '' END
+                || CASE WHEN IN_Data.Predictive_QoH_V3_Lag1 > IN_Data.Final_Forecast_PredQoHOnly_V2 THEN 'IN ' ELSE '' END
+                || CASE WHEN NE_Data.Predictive_QoH_V3_Lag1 > NE_Data.Final_Forecast_PredQoHOnly_V2 THEN 'NE ' ELSE '' END 
+                || CASE WHEN NV_Data.Predictive_QoH_V3_Lag1 > NV_Data.Final_Forecast_PredQoHOnly_V2 THEN 'NV ' ELSE '' END 
+                || CASE WHEN PA_Data.Predictive_QoH_V3_Lag1 > PA_Data.Final_Forecast_PredQoHOnly_V2 THEN 'PA ' ELSE '' END 
+                || CASE WHEN TX_Data.Predictive_QoH_V3_Lag1 > TX_Data.Final_Forecast_PredQoHOnly_V2 THEN 'TX ' ELSE '' END 
+                || CASE WHEN WA_Data.Predictive_QoH_V3_Lag1 > WA_Data.Final_Forecast_PredQoHOnly_V2 THEN 'WA ' ELSE '' END as FC_Combo,
+        
+            --Added 7/31/24 to remove add demand covered by previous step from unmet demand
+            --Updated 8/1/2024 to add Add_Demand V1 and 2 together
+        	CASE WHEN (Unmet_Output_V3.Add_DemandV1 + Unmet_Output_V3.Add_DemandV2) = 0  THEN 1 ELSE greatest(0, least(1, (Unmet_Output_V3.Predictive_QoH_V3_Lag1 - Unmet_Output_V3.Original_Forecast) / (Unmet_Output_V3.Add_DemandV1 + Unmet_Output_V3.Add_DemandV2))) END as Covered_MultiplierV2,
+        	--CASE WHEN Unmet_Output_V3.Add_DemandV1 = 0  THEN 1 ELSE greatest(0, least(1, (Unmet_Output_V3.Predictive_QoH_V3_Lag1 - Unmet_Output_V3.Original_Forecast) / Unmet_Output_V3.Add_DemandV1)) END as Covered_MultiplierV1_2,
+        	
+        	WA_Data.Unmet_Demand as WA_Unmet, NV_Data.Unmet_Demand as NV_Unmet, NE_Data.Unmet_Demand as NE_Unmet, TX_Data.Unmet_Demand as TX_Unmet,
+        	IN_Data.Unmet_Demand as IN_Unmet, PA_Data.Unmet_Demand as PA_Unmet, GA_Data.Unmet_Demand as GA_Unmet
+        FROM Unmet_Output_V3
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V3) as Unmet_Demand, Predictive_QoH_V3_Lag1, Final_Forecast_PredQoHOnly_V2 from Unmet_Output_V3 Where State = 'WA') WA_Data on WA_Data.ItemID = Unmet_Output_V3.ItemID AND WA_Data.daysfromtoday = Unmet_Output_V3.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V3) as Unmet_Demand, Predictive_QoH_V3_Lag1, Final_Forecast_PredQoHOnly_V2 from Unmet_Output_V3 Where State = 'NV') NV_Data on NV_Data.ItemID = Unmet_Output_V3.ItemID AND NV_Data.daysfromtoday = Unmet_Output_V3.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V3) as Unmet_Demand, Predictive_QoH_V3_Lag1, Final_Forecast_PredQoHOnly_V2 from Unmet_Output_V3 Where State = 'NE') NE_Data on NE_Data.ItemID = Unmet_Output_V3.ItemID AND NE_Data.daysfromtoday = Unmet_Output_V3.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V3) as Unmet_Demand, Predictive_QoH_V3_Lag1, Final_Forecast_PredQoHOnly_V2 from Unmet_Output_V3 Where State = 'TX') TX_Data on TX_Data.ItemID = Unmet_Output_V3.ItemID AND TX_Data.daysfromtoday = Unmet_Output_V3.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V3) as Unmet_Demand, Predictive_QoH_V3_Lag1, Final_Forecast_PredQoHOnly_V2 from Unmet_Output_V3 Where State = 'IN') IN_Data on IN_Data.ItemID = Unmet_Output_V3.ItemID AND IN_Data.daysfromtoday = Unmet_Output_V3.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V3) as Unmet_Demand, Predictive_QoH_V3_Lag1, Final_Forecast_PredQoHOnly_V2 from Unmet_Output_V3 Where State = 'PA') PA_Data on PA_Data.ItemID = Unmet_Output_V3.ItemID AND PA_Data.daysfromtoday = Unmet_Output_V3.daysfromtoday
+        	LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V3) as Unmet_Demand, Predictive_QoH_V3_Lag1, Final_Forecast_PredQoHOnly_V2 from Unmet_Output_V3 Where State = 'GA') GA_Data on GA_Data.ItemID = Unmet_Output_V3.ItemID AND GA_Data.daysfromtoday = Unmet_Output_V3.daysfromtoday);
+
+--Calculate Total FC coverage to remove from Unmet to redistribute --Added 7/31/24
+create or replace temp table FC_AddCoverageV2 as (
+        Select
+        	FC_ComboList_V3.ItemID,
+        	FC_ComboList_V3.daysfromtoday,
+        	SUM(WA_CoveredV2 * Covered_MultiplierV2) + SUM(FC_ComboList_V3.WA_CoveredV1 * Covered_MultiplierV2) as WA_CoveredV3,
+        	SUM(NV_CoveredV2 * Covered_MultiplierV2) + SUM(FC_ComboList_V3.NV_CoveredV1 * Covered_MultiplierV2) as NV_CoveredV3,
+        	SUM(NE_CoveredV2 * Covered_MultiplierV2) + SUM(FC_ComboList_V3.NE_CoveredV1 * Covered_MultiplierV2) as NE_CoveredV3,
+        	SUM(TX_CoveredV2 * Covered_MultiplierV2) + SUM(FC_ComboList_V3.TX_CoveredV1 * Covered_MultiplierV2) as TX_CoveredV3,
+        	SUM(IN_CoveredV2 * Covered_MultiplierV2) + SUM(FC_ComboList_V3.IN_CoveredV1 * Covered_MultiplierV2) as IN_CoveredV3,
+        	SUM(PA_CoveredV2 * Covered_MultiplierV2) + SUM(FC_ComboList_V3.PA_CoveredV1 * Covered_MultiplierV2) as PA_CoveredV3,
+        	SUM(GA_CoveredV2 * Covered_MultiplierV2) + SUM(FC_ComboList_V3.GA_CoveredV1 * Covered_MultiplierV2) as GA_CoveredV3
+        FROM FC_ComboList_V3
+        	LEFT JOIN RedistTable Redist on TRIM(Redist.FC_Combo) = TRIM(FC_ComboList_V3.FC_Combo) AND TRIM(Redist.Coverage_FC) = TRIM(FC_ComboList_V3.State)
+        GROUP BY FC_ComboList_V3.ItemID, FC_ComboList_V3.daysfromtoday);
+
+
+--Determine Demand that needs to be redistributed, apply based on baseline redistribution %  --Added 7/24/24
+--Updated 7/31/2024 to remove previously covered unmet demand to not be double counted
+create or replace temp table RedistributionV3 as (
+        Select
+        	Combo.ItemID,
+        	Combo.OriginID,
+        	Combo.daysfromtoday,
+        	Combo.FC_Combo,
+        	Combo.Node_QoH,
+        	Combo.Total_Receipt,
+        	Combo.Original_Forecast,
+        	Combo.GradeAdj_Forecast,
+        	Combo.Final_Forecast_PredQoHOnly_V2,
+        	Combo.Original_Unmet,
+        	Combo.Unmet_Demand_V2,
+        	Combo.Unmet_Demand_V3,
+        	Combo.Original_Predictive_QOH,
+        	Combo.Predictive_QoH_V2,
+        	Combo.Predictive_QoH_V3,
+        	Combo.Predictive_QoH_V3_Lag1,
+        	Combo.Covered_MultiplierV1,
+        	Combo.Covered_MultiplierV2,
+        	Combo.Add_DemandV1 * Combo.Covered_MultiplierV2 as Add_DemandV1,
+        	Combo.Add_DemandV2 * Combo.Covered_MultiplierV2 as Add_DemandV2,
+        	IFNULL((Combo.WA_Unmet - V2.WA_CoveredV3) * WA_Covered, 0) + IFNULL((Combo.NV_Unmet - V2.NV_CoveredV3) * NV_Covered, 0) + IFNULL((Combo.NE_Unmet - V2.NE_CoveredV3) * NE_Covered, 0) + IFNULL((Combo.TX_Unmet - V2.TX_CoveredV3) * TX_Covered, 0)
+        		+ IFNULL((Combo.IN_Unmet - V2.IN_CoveredV3) * IN_Covered, 0) + IFNULL((Combo.PA_Unmet - V2.PA_CoveredV3) * PA_Covered, 0) + IFNULL((Combo.GA_Unmet - V2.GA_CoveredV3) * GA_Covered, 0) as Add_DemandV3,
+        	V2.WA_CoveredV3, V2.NV_CoveredV3, V2.NE_CoveredV3, V2.TX_CoveredV3, V2.IN_CoveredV3, V2.PA_CoveredV3, V2.GA_CoveredV3,
+        	IFNULL(greatest(0, Combo.WA_Unmet - V2.WA_CoveredV3) * WA_Covered, 0) WA_CoveredV4,
+        	IFNULL(greatest(0, Combo.NV_Unmet - V2.NV_CoveredV3) * NV_Covered, 0) NV_CoveredV4,
+        	IFNULL(greatest(0, Combo.NE_Unmet - V2.NE_CoveredV3) * NE_Covered, 0) NE_CoveredV4,
+        	IFNULL(greatest(0, Combo.TX_Unmet - V2.TX_CoveredV3) * TX_Covered, 0) TX_CoveredV4,
+        	IFNULL(greatest(0, Combo.IN_Unmet - V2.IN_CoveredV3) * IN_Covered, 0) IN_CoveredV4,
+        	IFNULL(greatest(0, Combo.PA_Unmet - V2.PA_CoveredV3) * PA_Covered, 0) PA_CoveredV4,
+        	IFNULL(greatest(0, Combo.GA_Unmet - V2.GA_CoveredV3) * GA_Covered, 0) GA_CoveredV4
+        FROM FC_ComboList_V3 Combo
+        	LEFT JOIN FC_AddCoverageV2 V2 on V2.ItemID = Combo.ItemID AND V2.daysfromtoday = Combo.daysfromtoday
+        	LEFT JOIN RedistTable Redist on TRIM(Redist.FC_Combo) = TRIM(Combo.FC_Combo) AND TRIM(Redist.Coverage_FC) = TRIM(Combo.State));
+
+---------------Drop previous tables-------------
+drop table if exists FC_AddCoverageV2;
+
+--Cap at QoH and Calculate Final Demand Value  --Added 7/24/24
+create or replace temp table Redistribution_V3_Final as (
+        Select
+        	RedistributionV3.*,
+        	least(RedistributionV3.Add_DemandV3 + RedistributionV3.Final_Forecast_PredQoHOnly_V2, RedistributionV3.Predictive_QoH_V3_Lag1) as Final_Forecast_PredQoHOnly_V3
+        FROM RedistributionV3);
+
+---------------Drop previous tables-------------
+drop table if exists Unmet_Output_V3;
+drop table if exists FC_ComboList_V3;
+drop table if exists RedistributionV3;
+
+-----------------(Step 15A) Generate secondary predictive QoH using new demand with adjustment % applied-------------
+create or replace temp table Recursive_Predictive_V4 as (
+        with recursive_predictive_v4 as (-- base case
+            select 
+                red.itemid, red.originid, daysfromtoday, red.add_demandv1, red.add_demandv2, red.add_demandv3, original_unmet, red.unmet_demand_v2, red.unmet_demand_v3, gradeadj_forecast,
+            	wa_coveredv3, nv_coveredv3, ne_coveredv3, tx_coveredv3, in_coveredv3, pa_coveredv3, ga_coveredv3, wa_coveredv4, nv_coveredv4, ne_coveredv4, tx_coveredv4, in_coveredv4, pa_coveredv4, ga_coveredv4,
+                node_qoh, total_receipt, final_forecast_predqohonly_v3, red.original_forecast, red.original_predictive_qoh, red.predictive_qoh_v2, red.predictive_qoh_v3, red.covered_multiplierv1, red.covered_multiplierv2,
+                cast(greatest(0, node_qoh - final_forecast_predqohonly_v3) + total_receipt as float) as predictive_qoh_v4
+            from redistribution_v3_final red
+            where daysfromtoday = 0
+            
+            union all
+            -- recursive part
+            select 
+                red.itemid, red.originid, red.daysfromtoday, red.add_demandv1, red.add_demandv2, red.add_demandv3, red.original_unmet, red.unmet_demand_v2, red.unmet_demand_v3, red.gradeadj_forecast,
+            	red.wa_coveredv3, red.nv_coveredv3, red.ne_coveredv3, red.tx_coveredv3, red.in_coveredv3, red.pa_coveredv3, red.ga_coveredv3, red.wa_coveredv4, red.nv_coveredv4, red.ne_coveredv4, red.tx_coveredv4, red.in_coveredv4, red.pa_coveredv4, red.ga_coveredv4,
+                red.node_qoh, red.total_receipt, red.final_forecast_predqohonly_v3, red.original_forecast, red.original_predictive_qoh, red.predictive_qoh_v2, red.predictive_qoh_v3, red.covered_multiplierv1, red.covered_multiplierv2,
+                cast(case when r.predictive_qoh_v4 <= 0 then greatest(0, r.predictive_qoh_v4 + red.total_receipt) else greatest(0, r.predictive_qoh_v4 - red.final_forecast_predqohonly_v3) + red.total_receipt end as float) as predictive_qoh_v4
+            from redistribution_v3_final red
+                join recursive_predictive_v4 r on red.itemid = r.itemid and red.originid = r.originid and red.daysfromtoday = r.daysfromtoday + 1)
+            
+        select * from recursive_predictive_v4);
+
+
+-----------------(Step 15B) Generate Unmet Demand for each FC, Week Given Predictive QoH from Previous Step, Second version after Adjustment % for FC OOS-------------
+create or replace temp table Unmet_Output_V4 as (
+        select 
+        	recursive_predictive_v4.*,
+            s.state,
+        	greatest(0, original_forecast - cast(ifnull(lag(predictive_qoh_v4, 1) over (partition by itemid, recursive_predictive_v4.originid order by daysfromtoday), node_qoh) as float)) as unmet_demand_v4,
+        	cast(ifnull(lag(predictive_qoh_v4, 1) over (partition by itemid, recursive_predictive_v4.originid order by daysfromtoday), node_qoh) as float) as predictive_qoh_v4_lag1,
+        	greatest(0, gradeadj_forecast - cast(ifnull(lag(predictive_qoh_v4, 1) over (partition by itemid, recursive_predictive_v4.originid order by daysfromtoday), node_qoh) as float)) as gradeunmet_demand_v4,
+        	greatest(0, least(ifnull(lag(predictive_qoh_v4, 1) over (partition by itemid, recursive_predictive_v4.originid order by daysfromtoday), node_qoh) - original_forecast, final_forecast_predqohonly_v3 - original_forecast)) as original_covered_unmet
+        from recursive_predictive_v4
+        inner join fc_states as s on s.originid = recursive_predictive_v4.originid
+        );
+
+--Generate FC Combo List --Added 7/24/24
+create or replace temp table FC_ComboList_V4 as (
+        Select
+            Unmet_Output_V4.*,
+        --Added 7/31/24 at 4pm to remove FCs if fully covered with demand and add demand
+            CASE WHEN GA_Data.Predictive_QoH_V4_Lag1 > GA_Data.Final_Forecast_PredQoHOnly_V3 THEN 'GA ' ELSE '' END 
+                || CASE WHEN IN_Data.Predictive_QoH_V4_Lag1 > IN_Data.Final_Forecast_PredQoHOnly_V3 THEN 'IN ' ELSE '' END
+                || CASE WHEN NE_Data.Predictive_QoH_V4_Lag1 > NE_Data.Final_Forecast_PredQoHOnly_V3 THEN 'NE ' ELSE '' END 
+                || CASE WHEN NV_Data.Predictive_QoH_V4_Lag1 > NV_Data.Final_Forecast_PredQoHOnly_V3 THEN 'NV ' ELSE '' END 
+                || CASE WHEN PA_Data.Predictive_QoH_V4_Lag1 > PA_Data.Final_Forecast_PredQoHOnly_V3 THEN 'PA ' ELSE '' END
+                || CASE WHEN TX_Data.Predictive_QoH_V4_Lag1 > TX_Data.Final_Forecast_PredQoHOnly_V3 THEN 'TX ' ELSE '' END 
+                || CASE WHEN WA_Data.Predictive_QoH_V4_Lag1 > WA_Data.Final_Forecast_PredQoHOnly_V3 THEN 'WA ' ELSE '' END as FC_Combo,
+        
+            --Added 7/31/24 to remove add demand covered by previous step from unmet demand
+            CASE WHEN (Unmet_Output_V4.Add_DemandV1 + Unmet_Output_V4.Add_DemandV2 + Unmet_Output_V4.Add_DemandV3) = 0  THEN 1 
+                ELSE greatest(0, least(1, (Unmet_Output_V4.Predictive_QoH_V4_Lag1 - Unmet_Output_V4.Original_Forecast) / (Unmet_Output_V4.Add_DemandV1 + Unmet_Output_V4.Add_DemandV2 + Unmet_Output_V4.Add_DemandV3))) END as Covered_MultiplierV3,
+            
+            WA_Data.Unmet_Demand as WA_Unmet, NV_Data.Unmet_Demand as NV_Unmet, NE_Data.Unmet_Demand as NE_Unmet, TX_Data.Unmet_Demand as TX_Unmet,
+            IN_Data.Unmet_Demand as IN_Unmet, PA_Data.Unmet_Demand as PA_Unmet, GA_Data.Unmet_Demand as GA_Unmet
+        FROM Unmet_Output_V4
+            LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V4) as Unmet_Demand, Predictive_QoH_V4_Lag1, Final_Forecast_PredQoHOnly_V3 from Unmet_Output_V4 Where State = 'WA') WA_Data on WA_Data.ItemID = Unmet_Output_V4.ItemID AND WA_Data.daysfromtoday = Unmet_Output_V4.daysfromtoday
+            LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V4) as Unmet_Demand, Predictive_QoH_V4_Lag1, Final_Forecast_PredQoHOnly_V3 from Unmet_Output_V4 Where State = 'NV') NV_Data on NV_Data.ItemID = Unmet_Output_V4.ItemID AND NV_Data.daysfromtoday = Unmet_Output_V4.daysfromtoday
+            LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V4) as Unmet_Demand, Predictive_QoH_V4_Lag1, Final_Forecast_PredQoHOnly_V3 from Unmet_Output_V4 Where State = 'NE') NE_Data on NE_Data.ItemID = Unmet_Output_V4.ItemID AND NE_Data.daysfromtoday = Unmet_Output_V4.daysfromtoday
+            LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V4) as Unmet_Demand, Predictive_QoH_V4_Lag1, Final_Forecast_PredQoHOnly_V3 from Unmet_Output_V4 Where State = 'TX') TX_Data on TX_Data.ItemID = Unmet_Output_V4.ItemID AND TX_Data.daysfromtoday = Unmet_Output_V4.daysfromtoday
+            LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V4) as Unmet_Demand, Predictive_QoH_V4_Lag1, Final_Forecast_PredQoHOnly_V3 from Unmet_Output_V4 Where State = 'IN') IN_Data on IN_Data.ItemID = Unmet_Output_V4.ItemID AND IN_Data.daysfromtoday = Unmet_Output_V4.daysfromtoday
+            LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V4) as Unmet_Demand, Predictive_QoH_V4_Lag1, Final_Forecast_PredQoHOnly_V3 from Unmet_Output_V4 Where State = 'PA') PA_Data on PA_Data.ItemID = Unmet_Output_V4.ItemID AND PA_Data.daysfromtoday = Unmet_Output_V4.daysfromtoday
+            LEFT JOIN (Select ItemID, daysfromtoday, (Unmet_Demand_V4) as Unmet_Demand, Predictive_QoH_V4_Lag1, Final_Forecast_PredQoHOnly_V3 from Unmet_Output_V4 Where State = 'GA') GA_Data on GA_Data.ItemID = Unmet_Output_V4.ItemID AND GA_Data.daysfromtoday = Unmet_Output_V4.daysfromtoday);
+
+--Calculate Total FC coverage to remove from Unmet to redistribute --Added 7/31/24
+create or replace temp table FC_AddCoverageV3 as (
+        Select
+        	FC_ComboList_V4.ItemID,
+        	FC_ComboList_V4.daysfromtoday,
+        	SUM(Unmet_Demand_V4) as TotalUnmet,
+        	SUM(WA_CoveredV4 * Covered_MultiplierV3) + SUM(Add_DemandV1 * Covered_MultiplierV3) + SUM(Add_DemandV2 * Covered_MultiplierV3) as WA_CoveredV5,
+        	SUM(NV_CoveredV4 * Covered_MultiplierV3) + SUM(Add_DemandV1 * Covered_MultiplierV3) + SUM(Add_DemandV2 * Covered_MultiplierV3) as NV_CoveredV5,
+        	SUM(NE_CoveredV4 * Covered_MultiplierV3) + SUM(Add_DemandV1 * Covered_MultiplierV3) + SUM(Add_DemandV2 * Covered_MultiplierV3) as NE_CoveredV5,
+        	SUM(TX_CoveredV4 * Covered_MultiplierV3) + SUM(Add_DemandV1 * Covered_MultiplierV3) + SUM(Add_DemandV2 * Covered_MultiplierV3) as TX_CoveredV5,
+        	SUM(IN_CoveredV4 * Covered_MultiplierV3) + SUM(Add_DemandV1 * Covered_MultiplierV3) + SUM(Add_DemandV2 * Covered_MultiplierV3) as IN_CoveredV5,
+        	SUM(PA_CoveredV4 * Covered_MultiplierV3) + SUM(Add_DemandV1 * Covered_MultiplierV3) + SUM(Add_DemandV2 * Covered_MultiplierV3) as PA_CoveredV5,
+        	SUM(GA_CoveredV4 * Covered_MultiplierV3) + SUM(Add_DemandV1 * Covered_MultiplierV3) + SUM(Add_DemandV2 * Covered_MultiplierV3) as GA_CoveredV5
+        FROM FC_ComboList_V4
+        	--LEFT JOIN RedistTable Redist on Redist.FC_Combo = FC_ComboList_V4.FC_Combo AND Redist.Coverage_FC = FC_ComboList_V4.State
+        GROUP BY FC_ComboList_V4.ItemID, FC_ComboList_V4.daysfromtoday);
+
+--Determine Demand that needs to be redistributed, apply based on baseline redistribution %  --Added 7/24/24
+--Updated 7/31/2024 to remove previously covered unmet demand to not be double counted
+create or replace temp table RedistributionV4 as (
+        Select
+        	Combo.ItemID,
+        	Combo.OriginID,
+        	Combo.daysfromtoday,
+        	Combo.FC_Combo,
+        	Combo.Node_QoH,
+        	Combo.Total_Receipt,
+        	Combo.Original_Forecast,
+        	Combo.GradeAdj_Forecast,
+        	Combo.Final_Forecast_PredQoHOnly_V3,
+        	Combo.Original_Unmet,
+        	Combo.Unmet_Demand_V2,
+        	Combo.Unmet_Demand_V3,
+        	Combo.Unmet_Demand_V4,
+        	Combo.Original_Predictive_QOH,
+        	Combo.Predictive_QoH_V2,
+        	Combo.Predictive_QoH_V3,
+        	Combo.Predictive_QoH_V4,
+        	Combo.Predictive_QoH_V4_Lag1,
+        	Combo.Covered_MultiplierV1,
+        	Combo.Covered_MultiplierV2,
+        	Combo.Covered_MultiplierV3,
+        	Combo.Add_DemandV1 * Combo.Covered_MultiplierV3 as Add_DemandV1,
+        	Combo.Add_DemandV2 * Combo.Covered_MultiplierV3 as Add_DemandV2,
+        	Combo.Add_DemandV3 * Combo.Covered_MultiplierV3 as Add_DemandV3,
+        	GREATEST(IFNULL((Combo.WA_Unmet - V2.WA_CoveredV5) * WA_Covered, 0) + IFNULL((Combo.NV_Unmet - V2.NV_CoveredV5) * NV_Covered, 0) + IFNULL((Combo.NE_Unmet - V2.NE_CoveredV5) * NE_Covered, 0) + IFNULL((Combo.TX_Unmet - V2.TX_CoveredV5) * TX_Covered, 0)
+        		+ IFNULL((Combo.IN_Unmet - V2.IN_CoveredV5) * IN_Covered, 0) + IFNULL((Combo.PA_Unmet - V2.PA_CoveredV5) * PA_Covered, 0) + IFNULL((Combo.GA_Unmet - V2.GA_CoveredV5) * GA_Covered, 0), 0) as Add_DemandV4,
+        	V2.WA_CoveredV5, V2.NV_CoveredV5, V2.NE_CoveredV5, V2.TX_CoveredV5, V2.IN_CoveredV5, V2.PA_CoveredV5, V2.GA_CoveredV5,
+        	IFNULL(greatest(0, Combo.WA_Unmet - V2.WA_CoveredV5) * WA_Covered, 0) WA_CoveredV6,
+        	IFNULL(greatest(0, Combo.NV_Unmet - V2.NV_CoveredV5) * NV_Covered, 0) NV_CoveredV6,
+        	IFNULL(greatest(0, Combo.NE_Unmet - V2.NE_CoveredV5) * NE_Covered, 0) NE_CoveredV6,
+        	IFNULL(greatest(0, Combo.TX_Unmet - V2.TX_CoveredV5) * TX_Covered, 0) TX_CoveredV6,
+        	IFNULL(greatest(0, Combo.IN_Unmet - V2.IN_CoveredV5) * IN_Covered, 0) IN_CoveredV6,
+        	IFNULL(greatest(0, Combo.PA_Unmet - V2.PA_CoveredV5) * PA_Covered, 0) PA_CoveredV6,
+        	IFNULL(greatest(0, Combo.GA_Unmet - V2.GA_CoveredV5) * GA_Covered, 0) GA_CoveredV6
+        FROM FC_ComboList_V4 Combo
+        	LEFT JOIN FC_AddCoverageV3 V2 on V2.ItemID = Combo.ItemID AND V2.daysfromtoday = Combo.daysfromtoday
+        	LEFT JOIN RedistTable Redist on TRIM(Redist.FC_Combo) = TRIM(Combo.FC_Combo) AND TRIM(Redist.Coverage_FC) = TRIM(Combo.State));
+
+-----------------Drop previous tables-------------
+drop table if exists FC_AddCoverageV3;
+drop table if exists FC_ComboList_V4;
+
+--cap at qoh and calculate final demand value  --added 7/24/24
+create or replace temp table redistribution_v4_final as (
+        select
+        	redistributionv4.*,
+        	least(redistributionv4.add_demandv4 + redistributionv4.final_forecast_predqohonly_v3, redistributionv4.predictive_qoh_v4_lag1) as final_forecast_predqohonly_v4
+        from redistributionv4);
+
+-----------------(step 15a) generate secondary predictive qoh using new demand with adjustment % applied-------------
+create or replace temp table recursive_predictive_v5 as (
+        with recursive_predictive_v5 as (-- base case
+            select 
+                red.itemid, red.originid, red.daysfromtoday, red.add_demandv1, red.add_demandv2, red.add_demandv3, red.add_demandv4, original_unmet, red.unmet_demand_v2, red.unmet_demand_v3, red.unmet_demand_v4, gradeadj_forecast,
+            	wa_coveredv5, nv_coveredv5, ne_coveredv5, tx_coveredv5, in_coveredv5, pa_coveredv5, ga_coveredv5, wa_coveredv6, nv_coveredv6, ne_coveredv6, tx_coveredv6, in_coveredv6, pa_coveredv6, ga_coveredv6,
+                node_qoh, total_receipt, final_forecast_predqohonly_v4, red.original_forecast, red.original_predictive_qoh, red.predictive_qoh_v2, red.predictive_qoh_v3, red.predictive_qoh_v4, red.covered_multiplierv1, red.covered_multiplierv2, red.covered_multiplierv3,
+                cast(greatest(0, node_qoh - final_forecast_predqohonly_v4) + total_receipt as float) as predictive_qoh_v5
+            from redistribution_v4_final red
+            where daysfromtoday = 0
+            --  and 1=0
+            
+            union all
+            -- recursive part
+            select 
+                red.itemid, red.originid, red.daysfromtoday, red.add_demandv1, red.add_demandv2, red.add_demandv3, red.add_demandv4, red.original_unmet, red.unmet_demand_v2, red.unmet_demand_v3, red.unmet_demand_v4, red.gradeadj_forecast,
+            	red.wa_coveredv5, red.nv_coveredv5, red.ne_coveredv5, red.tx_coveredv5, red.in_coveredv5, red.pa_coveredv5, red.ga_coveredv5, red.wa_coveredv6, red.nv_coveredv6, red.ne_coveredv6, red.tx_coveredv6, red.in_coveredv6, red.pa_coveredv6, red.ga_coveredv6,
+                red.node_qoh, red.total_receipt, red.final_forecast_predqohonly_v4, red.original_forecast, red.original_predictive_qoh, red.predictive_qoh_v2, red.predictive_qoh_v3, red.predictive_qoh_v4, red.covered_multiplierv1, red.covered_multiplierv2, red.covered_multiplierv3,
+                cast(case when r.predictive_qoh_v5 <= 0 then greatest(0, r.predictive_qoh_v5 + red.total_receipt) else greatest(0, r.predictive_qoh_v5 - red.final_forecast_predqohonly_v4) + red.total_receipt end as float) as predictive_qoh_v5
+            from redistribution_v4_final red
+                join recursive_predictive_v5 r on red.itemid = r.itemid and red.originid = r.originid and red.daysfromtoday = r.daysfromtoday + 1 and red.daysfromtoday <= 732)
+            
+        select * from recursive_predictive_v5);
+
+
+-----------------(Step ) Generate Unmet Demand for each FC, Week Given Predictive QoH from Previous Step, Second version after Adjustment % for FC OOS-------------
+create or replace temp table Unmet_Output_V5 as (
+        select V5.*,
+        s.state,
+        greatest(0, original_forecast - cast(ifnull(lag(predictive_qoh_v5, 1) over (partition by itemid, V5.originid order by daysfromtoday), node_qoh) as float)) as unmet_demand_v5,
+        cast(ifnull(lag(predictive_qoh_v5, 1) over (partition by itemid, V5.originid order by daysfromtoday), node_qoh) as float) as predictive_qoh_v5_lag1,
+        greatest(0, gradeadj_forecast - cast(ifnull(lag(predictive_qoh_v5, 1) over (partition by itemid, V5.originid order by daysfromtoday), node_qoh) as float)) as gradeunmet_demand_v5,
+        greatest(0, least(ifnull(lag(predictive_qoh_v5, 1) over (partition by itemid, V5.originid order by daysfromtoday), node_qoh) - original_forecast, final_forecast_predqohonly_v4 - original_forecast)) as original_covered_unmet,
+        case when V5.add_demandv4 = 0  then 1 else greatest(0, least(1, (cast(ifnull(lag(predictive_qoh_v5, 1) over (partition by itemid, V5.originid order by daysfromtoday), node_qoh) as float) - V5.original_forecast) 
+                / V5.add_demandv4)) end as covered_multiplierv4
+        from recursive_predictive_v5 V5
+        inner join fc_states as s on s.originid = V5.originid);
+
+-----------------Drop previous tables-------------
+drop table if exists RedistributionV4;
+drop table if exists Redistribution_V4_Final;
+drop table if exists Unmet_Output_V4;
+
+-----------------(Step ) Determine assumed sell through, actual sell through. Used to adjust QoH to match network sell through expectation-------------
+--Subtables 16A-E added 12/14/2023 to adjust network QoH for missed demand due to redistribution logic--
+--Updated 12/28/2023 to remove current WEEK receipt qty from Current_Pred_QoH so the adjustment can be applied to the quantity that is being sold through later--
+create or replace temp table network_sellthrough_var as (
+        select 
+        	v5.itemid,
+        	v5.originid,
+        	v5.daysfromtoday,
+        	v5.original_forecast,
+        	v5.node_qoh,
+        	ifnull(lag(predictive_qoh_v5, 1) over (partition by itemid, originid order by daysfromtoday), node_qoh) as lw_pred_qoh,
+        	predictive_qoh_v5 as current_pred_qoh,
+        	greatest(0, predictive_qoh_v5 - total_receipt) as current_pred_qoh_receiptremoved,
+        	v5.total_receipt,
+        	(ifnull(lag(predictive_qoh_v5, 1) over (partition by itemid, originid order by daysfromtoday), node_qoh) + v5.total_receipt) - v5.predictive_qoh_v5 as assumed_sales
+        from unmet_output_v5 v5);
+
+-------------------(Step 16B) Calculate % of QoH by FC for each WEEK, this is the % of the network adjustment that will be applied to each node-------------
+create or replace temp table QoH_Precent as (
+        select
+        	itemid,
+        	originid,
+        	daysfromtoday,
+        	case when (sum(current_pred_qoh_receiptremoved) over (partition by itemid, daysfromtoday)) = 0 then 0 else current_pred_qoh_receiptremoved / (sum(current_pred_qoh_receiptremoved) over (partition by itemid, daysfromtoday)) end as qoh_percent
+        from network_sellthrough_var);
+
+-------------------(Step 16C) Generate the initial sell through adjustment due to node missing sales-------------
+create or replace temp table network_sellthrough_adj_step1 as (
+        select 
+        	itemid,
+        	daysfromtoday,
+        	sum(assumed_sales) as assumed_sales,--temp
+        	sum(node_qoh) as network_qoh,
+        	sum(original_forecast) as forecast,
+        	sum(current_pred_qoh) as current_pred_qoh,
+        	round(case when (sum(total_receipt) = 0 and sum(original_forecast) > sum(lw_pred_qoh) and sum(current_pred_qoh) > 0) then -sum(current_pred_qoh)
+        			when (sum(current_pred_qoh) = 0 or sum(original_forecast) > sum(lw_pred_qoh)) then 0 
+        				else sum(assumed_sales) - sum(original_forecast) end, 0) as sellthrough_adjustment
+        from network_sellthrough_var
+        group by itemid, daysfromtoday);
+
+-------------------(Step 16D) Calculate cumulative sell through adjustment by WEEK and the most recent node OOS, the cumulative is what is removed from QoH and the max OOS date is used to eliminate adjustment after network OOS period-------
+create or replace temp table network_sellthrough_adj_step2 as (
+        select
+        	itemid,
+        	daysfromtoday,
+        	current_pred_qoh,
+        	forecast,
+        	sellthrough_adjustment,
+        	sum(sellthrough_adjustment) over (partition by itemid order by daysfromtoday) as cumulative_sellthrough_adj,
+        	ifnull(lag(current_pred_qoh, 1) over (partition by itemid order by daysfromtoday), network_qoh) + ifnull(lag(sellthrough_adjustment, 1) over (partition by itemid order by daysfromtoday), 0) as lw_qoh,
+        	case when (ifnull(lag(current_pred_qoh, 1) over (partition by itemid order by daysfromtoday), network_qoh) + ifnull(lag(sellthrough_adjustment, 1) over (partition by itemid order by daysfromtoday), 0)) <= forecast then daysfromtoday else null end as oos_entry
+        from network_sellthrough_adj_step1);
+
+-------------------(Step 16D-2) Lag OOS Entry 1-------------
+create or replace temp table network_sellthrough_adj_step3 as (
+        select
+        	step2.*,
+        	lag(step2.oos_entry, 1) over (partition by itemid order by daysfromtoday) as oos_entryused
+        from network_sellthrough_adj_step2 step2);
+
+-------------------(Step 16D-3) Add the MaxOOSEntryDate for next step-------------
+create or replace temp table Network_SellThrough_Adj_Step4 as (
+        select
+        	step3.*,
+        	max(oos_entryused) over (partition by itemid order by daysfromtoday) as mostrecentoos_daysfromtoday
+        from network_sellthrough_adj_step3 step3);
+
+-----------------(Step 16E) Removes cumulative sell through adjustment if there has been a network OOS time period in between, final output to be used in Step 17-------------
+create or replace temp table network_sellthrough_adj as (
+        select
+        	adj.*,
+        	(adj.cumulative_sellthrough_adj - ifnull(subtable.cumulative_sellthrough_adj, 0)) as cumulative_sellthrough_adj_used
+        from network_sellthrough_adj_step4 adj
+        	left join (select itemid, daysfromtoday, cumulative_sellthrough_adj from network_sellthrough_adj_step4) subtable on subtable.itemid = adj.itemid and subtable.daysfromtoday = adj.mostrecentoos_daysfromtoday);
+
+-----------------Drop previous tables-------------
+drop table if exists Network_SellThrough_Var;
+drop table if exists Network_SellThrough_Adj_Step1;
+drop table if exists Network_SellThrough_Adj_Step2;
+drop table if exists Network_SellThrough_Adj_Step3;
+drop table if exists Network_SellThrough_Adj_Step4;
+--Temp tables not dropped: Unmet_Output_V4 (Step 15B), QoH_Precent (Step 16B), Network_SellThrough_Adj (Step 16E)
+
+------------------(Step 17A) Subset FC Data for final joins ----------------------------------------------------
+create or replace temp table fc_data as (
+        select 
+            itemid,
+            daysfromtoday,
+            originid,
+            unmet_demand_v5 as unmet_demand,
+            predictive_qoh_v5_lag1,
+            greatest(original_forecast, final_forecast_predqohonly_v4) as final_forecast_predqohonly_v4 
+        from unmet_output_v5);
+
+-- --Adjust WH Size
+alter warehouse INVENTORYMODEL_WH set warehouse_size = MEDIUM; 
+
+INSERT INTO inventorysandbox.dbo.RFP_PredictedQoHV2 (
+    itemid,
+    DATEVALUE,
+    FC,
+    ORDERTYPE,
+    LT_DATE,
+    OTF_DATE,
+    Output_FreightOptQty,
+    DAYSFROMTODAY,
+    NODEQOH,
+    QOO,
+    FORECAST,
+    FINAL_FORECAST_USED,
+    ENDING_PREDICTIVEQOH,
+    UNMETDEMAND,
+    CUMULATIVE_UNMET,
+    ORDERQTY_REMAINING,
+    UPDATED_UNMET,   
+    PREDICTEDQOH,
+    RFP_ITERATION_COUNT
+)
+
+-----------------(Step 17) Final Output, Final Network Level QoH Adjustment-------------
+-- create or replace table inventorysandbox.dbo.RFP_current_PredictedQoHV2 as (
+        select 
+        	v4.itemid,
+            DATEADD(day, v4.daysfromtoday, current_date()) as DATEVALUE,
+            V4.state as FC,
+            'import' as ORDERTYPE,
+            DATEADD(day, DEC.LT - 1, current_date()) as LT_DATE,
+            DATEADD(day, DEC.LT + DEC.OTF - 1, current_date()) as OTF_DATE,
+            DEC."Output_FreightOptQty",
+            v4.daysfromtoday as DAYSFROMTODAY,
+            CASE WHEN V4.daysfromtoday = 0 THEN V4.Node_QoH ELSE NULL END as NODEQOH,
+        	V4.Total_Receipt as QOO,
+        	V4.Original_Forecast as FORECAST,
+            LEAST(v4.final_forecast_predqohonly_v4, GREATEST(0, ROUND(V4.Predictive_QoH_V5 + 
+                CASE WHEN (IFNULL(LAG(V4.Predictive_QoH_V5) OVER (PARTITION BY V4.ItemID, V4.OriginID ORDER BY V4.daysfromtoday asc), V4.Node_QoH) = 0 AND V4.Total_Receipt > 0) THEN 0 
+                    ELSE (Cumulative_SellThrough_Adj_Used * QoH_Precent.QoH_Percent) END, 0))) as FINAL_FORECAST_USED,
+        	GREATEST(0, ROUND(V4.Predictive_QoH_V5 + CASE WHEN (IFNULL(LAG(V4.Predictive_QoH_V5) OVER (PARTITION BY V4.ItemID, V4.OriginID ORDER BY V4.daysfromtoday asc), V4.Node_QoH) = 0 AND V4.Total_Receipt > 0)
+        			THEN 0 ELSE (Cumulative_SellThrough_Adj_Used * QoH_Precent.QoH_Percent) END, 0)) as ENDING_PREDICTIVEQOH,
+            V4.Unmet_Demand_V4 as UNMETDEMAND,
+            V4.Unmet_Demand_V4 as CUMULATIVE_UNMET,
+            DEC."Output_FreightOptQty" as ORDERQTY_REMAINING,
+            V4.Unmet_Demand_V4 as UPDATED_UNMET,   
+        	GREATEST(0, ROUND(V4.Predictive_QoH_V5 + CASE WHEN (IFNULL(LAG(V4.Predictive_QoH_V5) OVER (PARTITION BY V4.ItemID, V4.OriginID ORDER BY V4.daysfromtoday asc), V4.Node_QoH) = 0 AND V4.Total_Receipt > 0)
+        			THEN 0 ELSE (Cumulative_SellThrough_Adj_Used * QoH_Precent.QoH_Percent) END, 0)) as PREDICTEDQOH,
+            DEC.RFP_ITERATION_COUNT
+        From Unmet_Output_V5 V4
+        	left join network_sellthrough_adj on network_sellthrough_adj.itemid = v4.itemid and network_sellthrough_adj.daysfromtoday = v4.daysfromtoday
+        	left join qoh_precent on qoh_precent.itemid = v4.itemid and qoh_precent.OriginID = v4.OriginID and qoh_precent.daysfromtoday = v4.daysfromtoday
+            left join (with MAX_RFP_ITER as (select MAX(RFP_ITERATION_COUNT) as MAXRFP_ITERATION_COUNT FROM inventorysandbox.dbo.RFP_OrderDecision) select ITEMID, FC, ORDERTYPE, RFP_ITERATION_COUNT, LT, OTF, "Output_FreightOptQty"  from inventorysandbox.dbo.RFP_OrderDecision DEC INNER JOIN MAX_RFP_ITER on MAX_RFP_ITER.MAXRFP_ITERATION_COUNT = DEC.RFP_ITERATION_COUNT WHERE ORDERTYPE = 'import') DEC on DEC.ITEMID = V4.ITEMID AND DEC.FC = V4.state;
+            --WHERE v4.daysfromtoday >= (DEC.LT - 1)
+            -- );
+
+create or replace table inventorysandbox.dbo.RFP_Simulation_Process_Count as (
+Select 2 as "Iteration");
+
+call INVENTORYSANDBOX.DBO.AOG_Iteration_Test_Simulation();
+            
+END
+-- -----------------Drop previous tables-------------
+-- drop table if exists Unmet_Output_V5;
+-- drop table if exists QoH_Precent;
+-- drop table if exists Network_SellThrough_Adj;
