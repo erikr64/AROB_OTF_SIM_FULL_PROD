@@ -1,0 +1,31 @@
+--Alter task AOG_History resume;
+create or replace task AOG_History
+    warehouse = INVENTORYMODEL_WH
+    as begin
+
+--Simulation
+INSERT INTO inventorysandbox.dbo.RFP_ordering_sim_history
+Select * from inventorysandbox.dbo.RFP_ordering_sim
+;
+
+-- INSERT INTO inventorysandbox.dbo.RFP_IB_optimization_history
+-- Select * from inventorysandbox.dbo.RFP_IB_optimization
+-- ;
+
+-- INSERT INTO inventorysandbox.dbo.RFP_ProfitVariable_history
+-- Select * from inventorysandbox.dbo.RFP_ProfitVariable
+-- ;
+
+INSERT INTO inventorysandbox.dbo.RFP_OrderDecision_history
+Select * from inventorysandbox.dbo.RFP_OrderDecision
+;
+
+INSERT INTO inventorysandbox.dbo.RFP_InventoryModelDomestic_history
+Select * from inventorysandbox.dbo.RFP_InventoryModelDomestic
+;
+
+INSERT INTO inventorysandbox.dbo.RFP_InventoryModelImport_history
+Select * from inventorysandbox.dbo.RFP_InventoryModelImport
+;
+
+END
