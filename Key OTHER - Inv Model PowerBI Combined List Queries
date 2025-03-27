@@ -1,0 +1,513 @@
+--Updated --Select * from inventorysandbox.dbo.RFP_InventoryModelCombined_DOS WHERE NEW_ORDERQTY > 0
+
+create or replace task RFP_GEN_POWERBI_DATASET
+    warehouse = INVENTORYMODEL_WH
+    as begin
+
+create or replace temp table COUNT_SUM_DECSIM as (
+Select
+    dimprod.SUPPLIERID,
+    ordertype,
+    count(dimprod.ITEMID) as OTFSimBrandOrderCount
+
+from inventorysandbox.dbo.RFP_OrderDecision 
+LEFT JOIN lakehouse.spreedw_dim.product dimprod on dimprod.itemid = RFP_OrderDecision.ITEMID
+-- Where ordertype = 'domestic'
+-- AND dimprod.ITEMID = 325270
+GROUP BY dimprod.SUPPLIERID, ordertype
+);
+
+create or replace temp table COUNT_SUM_DECCURRENT as (
+Select
+    dimprod.SUPPLIERID,
+    ordertype,
+    count(dimprod.ITEMID) as OTFCurrentBrandOrderCount
+
+from inventorysandbox.dbo.RFP_current_OrderDecision
+LEFT JOIN lakehouse.spreedw_dim.product dimprod on dimprod.itemid = RFP_current_OrderDecision.ITEMID
+-- Where ordertype = 'domestic'
+-- AND dimprod.ITEMID = 325270
+GROUP BY dimprod.SUPPLIERID, ordertype
+);
+
+create or replace temp table NETWORK_VALUES as (
+Select 
+    ITEMID,
+    DAYSFROMTODAY,
+    SUM(ENDING_PREDICTIVEQOH) as Original_NetworkQoH
+    
+from spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_HISTORY HISTORY
+Where GENERATEDON = current_date() --'2024-12-28'
+GROUP BY ITEMID, DAYSFROMTODAY
+);
+
+
+create or replace temp table OTFSim_InventoryModel as (
+
+        Select InvModel.*,
+        DEC.RFP_ITERATION_COUNT,
+        DOS.OTF as OrderOTF,
+        DOS.LT OrderLT,
+        NEW_ORDERQTY,
+        OutputDoS.ENDING_PREDICTIVEQOH as Original_QoH,
+        OutputDoS.UNMETDEMAND as Original_Unmet,
+        OutputDoS.TOTALRECEIPT as Original_Receipt,
+        DOS.DAYSOFSUPPLY as Network_DoS,
+        DEC."Total_SolCost" as TOTAL_SOLCOST,
+        DEC."Total_SolCost_Used" as TOTAL_SOLCOST_USED,
+        DEC."Total_Freight_Cost" as Total_Freight_Cost,
+        DEC.SCENARIO_ADD_COST_OBSHIP,
+        DEC.SCENARIO_OOS_LOST_MARGIN,
+        DEC.HOLDING_COST_ADD,
+        DEC.NETWORK_TOTALCOST,
+        
+        CASE 
+            WHEN DAYSOFSUPPLY >= DOS.OTF AND DAYSOFSUPPLY <= (DOS.OTF + 28) THEN 'VALID_TOTAL'
+            WHEN ((SELECT MAX(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelCombined_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND 
+                DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) <= (DOS.OTF + 28) AND (SELECT MIN(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelCombined_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND 
+                DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) > 0) THEN 'VALID_FUTURE_FLOW'
+            WHEN (DAYSOFSUPPLY > (DOS.OTF + 28) OR DAYSOFSUPPLY IS NULL) AND NEW_ORDERQTY = 0 THEN 'VALID_NO_ORDER'
+            WHEN sim.NET_MAXQOHOTF > sim.NET_CAP AND sim.QOH_AFTER_LT > 0 AND sim.MIN_OTF_REQ <= 0.5 THEN 'VALID_CAPPED'
+            WHEN DOS.FORECAST = 0 THEN 'VALID_NO_DEMAND'
+            -- WHEN (DOS.TOTAL_FUTURE_FORECAST - FORECAST) < ENDING_PREDICTIVEQOH AND ENDING_PREDICTIVEQOH < (NET_CAP + FORECAST) THEN 'VALID_FINAL_ORDER'
+            WHEN DAYSOFSUPPLY >= (DOS.OTF - 3) AND DAYSOFSUPPLY <= (DOS.OTF + 31) THEN 'ERROR_THREEDAYS'
+            WHEN DAYSOFSUPPLY >= (DOS.OTF - 7) AND DAYSOFSUPPLY <= (DOS.OTF + 35) THEN 'ERROR_SEVENDAYS'
+            WHEN sim.OTF_UNMET < 0.5 THEN 'ERROR_<.5UNMET'
+            WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND NEW_ORDERQTY <= PRODUCT.CASEQUANTITY THEN 'ERROR_SINGLE_CASE_ORDERED_EXCESSDOS'
+            WHEN sim.OTF_UNMET <= (PRODUCT.CASEQUANTITY * .75) THEN 'ERROR_<.75_CASEPACK_UNMET'
+            WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND NEW_ORDERQTY <= 5 THEN 'ERROR_LOW_QUANTITY'
+            WHEN (DOS.OTF + DOS.LT + 14) > 359 AND DAYSOFSUPPLY IS NULL THEN 'ERROR_TOOFEW_DAYSAVAIL'
+            ELSE 'ERROR' 
+        END AS DOS_ERROR_TYPE
+        
+        from inventorysandbox.dbo.RFP_InventoryModelCombined InvModel
+        LEFT JOIN spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_HISTORY OutputDoS on OutputDoS.ITEMID = InvModel.ITEMID AND OutputDoS.STATE = InvModel.STATE AND OutputDoS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY 
+            AND OutputDoS.GENERATEDON = current_date() --'2024-12-15'
+        LEFT JOIN inventorysandbox.dbo.RFP_InventoryModelCombined_DOS DOS on DOS.ITEMID = InvModel.ITEMID AND DOS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY
+        LEFT JOIN (Select ITEMID, OTF, LT, MIN(NET_MAXQOHOTF) as NET_MAXQOHOTF, MIN(NET_CAP) as NET_CAP, SUM(QOH_AFTER_LT) as QOH_AFTER_LT, SUM(MIN_OTF_REQ) as MIN_OTF_REQ, SUM(OTF_UNMET) as OTF_UNMET from inventorysandbox.dbo.RFP_ordering_sim GROUP BY ITEMID, OTF, LT) sim on sim.ITEMID = DOS.ITEMID AND sim.OTF = DOS.OTF AND sim.LT = DOS.LT
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT PRODUCT ON PRODUCT.ITEMID = DOS.ITEMID
+        LEFT JOIN inventorysandbox.dbo.RFP_OrderDecision DEC on DEC.ITEMID = InvModel.ITEMID AND DEC.FC = InvModel.STATE AND DEC.OTF = DOS.OTF AND DEC.LT = DOS.LT AND DEC.ordertype = InvModel.ordertype
+        -- WHERE InvModel.ITEMID = 323601
+
+);
+
+create or replace temp table OTFCurrent_InventoryModel as (
+
+    Select InvModel.*,
+        DEC.RFP_ITERATION_COUNT,
+        DOS.OTF as OrderOTF,
+        DOS.LT OrderLT,
+        NEW_ORDERQTY,
+        OutputDoS.ENDING_PREDICTIVEQOH as Original_QoH,
+        OutputDoS.UNMETDEMAND as Original_Unmet,
+        OutputDoS.TOTALRECEIPT as Original_Receipt,
+        DOS.DAYSOFSUPPLY as Network_DoS,
+        DEC."Total_SolCost" as TOTAL_SOLCOST,
+        DEC."Total_SolCost_Used" as TOTAL_SOLCOST_USED,
+        DEC."Total_Freight_Cost" as Total_Freight_Cost,
+        DEC.SCENARIO_ADD_COST_OBSHIP,
+        DEC.SCENARIO_OOS_LOST_MARGIN,
+        DEC.HOLDING_COST_ADD,
+        DEC.NETWORK_TOTALCOST,
+        
+        CASE 
+            WHEN DAYSOFSUPPLY >= DOS.OTF AND DAYSOFSUPPLY <= (DOS.OTF + 28) THEN 'VALID_TOTAL'
+            WHEN ((SELECT MAX(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelCombined_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND 
+                DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) <= (DOS.OTF + 28) AND (SELECT MIN(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelCombined_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND 
+                DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) > 0) THEN 'VALID_FUTURE_FLOW'
+            WHEN (DAYSOFSUPPLY > (DOS.OTF + 28) OR DAYSOFSUPPLY IS NULL) AND NEW_ORDERQTY = 0 THEN 'VALID_NO_ORDER'
+            WHEN sim.NET_MAXQOHOTF > sim.NET_CAP AND sim.QOH_AFTER_LT > 0 AND sim.MIN_OTF_REQ <= 0.5 THEN 'VALID_CAPPED'
+            WHEN DOS.FORECAST = 0 THEN 'VALID_NO_DEMAND'
+            WHEN (DOS.TOTAL_FUTURE_FORECAST - DOS.FORECAST) < DOS.ENDING_PREDICTIVEQOH AND DOS.ENDING_PREDICTIVEQOH < (NET_CAP + DOS.FORECAST) THEN 'VALID_FINAL_ORDER'
+            WHEN DAYSOFSUPPLY >= (DOS.OTF - 3) AND DAYSOFSUPPLY <= (DOS.OTF + 31) THEN 'ERROR_THREEDAYS'
+            WHEN DAYSOFSUPPLY >= (DOS.OTF - 7) AND DAYSOFSUPPLY <= (DOS.OTF + 35) THEN 'ERROR_SEVENDAYS'
+            WHEN sim.OTF_UNMET < 0.5 THEN 'ERROR_<.5UNMET'
+            WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND NEW_ORDERQTY <= PRODUCT.CASEQUANTITY THEN 'ERROR_SINGLE_CASE_ORDERED_EXCESSDOS'
+            WHEN sim.OTF_UNMET <= (PRODUCT.CASEQUANTITY * .75) THEN 'ERROR_<.75_CASEPACK_UNMET'
+            WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND NEW_ORDERQTY <= 5 THEN 'ERROR_LOW_QUANTITY'
+            WHEN (DOS.OTF + DOS.LT + 14) > 359 AND DAYSOFSUPPLY IS NULL THEN 'ERROR_TOOFEW_DAYSAVAIL'
+            ELSE 'ERROR' 
+        END AS DOS_ERROR_TYPE
+        
+        from inventorysandbox.dbo.RFP_current_InventoryModelCombined InvModel
+        LEFT JOIN spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_HISTORY OutputDoS on OutputDoS.ITEMID = InvModel.ITEMID AND OutputDoS.STATE = InvModel.STATE AND OutputDoS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY
+            AND OutputDoS.GENERATEDON = current_date() --'2024-12-15'
+        LEFT JOIN inventorysandbox.dbo.RFP_current_InventoryModelCombined_DOS DOS on DOS.ITEMID = InvModel.ITEMID AND DOS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY
+        LEFT JOIN (Select ITEMID, OTF, LT, MIN(NET_MAXQOHOTF) as NET_MAXQOHOTF, MIN(NET_CAP) as NET_CAP, SUM(QOH_AFTER_LT) as QOH_AFTER_LT, SUM(MIN_OTF_REQ) as MIN_OTF_REQ, SUM(OTF_UNMET) as OTF_UNMET from inventorysandbox.dbo.RFP_ordering_sim GROUP BY ITEMID, OTF, LT) sim on sim.ITEMID = DOS.ITEMID AND sim.OTF = DOS.OTF AND sim.LT = DOS.LT
+        LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT PRODUCT ON PRODUCT.ITEMID = DOS.ITEMID
+        LEFT JOIN inventorysandbox.dbo.RFP_current_OrderDecision DEC on DEC.ITEMID = InvModel.ITEMID AND DEC.FC = InvModel.STATE AND DEC.OTF = DOS.OTF AND DEC.LT = DOS.LT AND DEC.ordertype = InvModel.ORDERTYPE 
+        -- WHERE InvModel.ITEMID = 323601
+
+);
+
+create or replace temp table OTFCurrent_InventoryModel_Network as (
+Select
+    ITEMID,
+    DAYSFROMTODAY,
+    SUM(ENDING_PREDICTIVEQOH) as OTFCurrent_NetworkQoH
+
+FROM OTFCurrent_InventoryModel
+GROUP BY ITEMID, DAYSFROMTODAY
+);
+
+create or replace temp table OTFSim_InventoryModel_Network as (
+Select
+    ITEMID,
+    DAYSFROMTODAY,
+    SUM(ENDING_PREDICTIVEQOH) as OTFSim_NetworkQoH,
+    SUM(FORECAST) as Network_Forecast,
+    SUM(Original_QoH) as Original_NetworkQoH
+
+FROM OTFSim_InventoryModel
+GROUP BY ITEMID, DAYSFROMTODAY
+);
+
+create or replace table inventorysandbox.dbo.RFP_InventoryModelPowerBI_Dataset as (
+
+Select 
+    OTFSim.PARTNUMBER,
+    OTFSim.ITEMID,
+    OTFSim.ORDERTYPE,
+    dimprod.supplierid,
+    OTFSim.STATE,
+    OTFSim.DAYSFROMTODAY,
+    OTFSim.NODEQOH,
+    OTFSim.FORECAST,
+    OTFSim.ORIGINAL_QOH,
+    OTFSim.ORIGINAL_UNMET,
+    OTFSim.ORIGINAL_RECEIPT,
+    current_date() + OTFSim.DAYSFROMTODAY as DATEVALUE,
+    RANK() OVER (PARTITION BY dimprod.supplierid ORDER BY OTFSim.ITEMID) AS Item_Brand_Rank,
+    Network_Forecast,
+    Original_NetworkQoH,
+    greatest(0, Network_Forecast - Original_NetworkQoH) as Original_Net_Unmet,
+
+    OTFSim.TOTALRECEIPT as OTFSim_TOTALRECEIPT,
+    OTFSim.UNMETDEMAND as OTFSim_UNMETDEMAND,
+    OTFSim.ENDING_PREDICTIVEQOH as OTFSim_ENDING_PREDICTIVEQOH,
+    OTFSim.RFP_ITERATION_COUNT as OTFSim_ORDERNUMBER,
+    OTFSim.ORDEROTF as OTFSim_ORDEROTF,
+    OTFSim.ORDERLT as OTFSim_ORDERLT,
+    OTFSim.NEW_ORDERQTY as OTFSim_DOM_ORDERQTY,
+    OTFSim.NETWORK_DOS as OTFSim_NETWORK_DOS,
+    OTFSim.DOS_ERROR_TYPE as OTFSim_DOS_ERROR_TYPE,
+    OTFSim.Total_SolCost as OTFSim_Total_SolCost,
+    OTFSim.Total_SolCost_Used as OTFSim_Total_SolCost_Used,
+    OTFSim.Total_Freight_Cost as OTFSim_Total_Freight_Cost,
+    OTFSim.SCENARIO_ADD_COST_OBSHIP as OTFSim_SCENARIO_ADD_COST_OBSHIP,
+    OTFSim.SCENARIO_OOS_LOST_MARGIN as OTFSim_SCENARIO_OOS_LOST_MARGIN,
+    OTFSim.HOLDING_COST_ADD as OTFSim_HOLDING_COST_ADD,
+    OTFSim.NETWORK_TOTALCOST as OTFSim_NETWORK_TOTALCOST,
+    CASE WHEN OTFSim.DAYSFROMTODAY = 0 THEN OTFSim.NODEQOH ELSE OTFSimLagged.ENDING_PREDICTIVEQOH END * FIFO.FIFOAVERAGECOST as OTFSim_Beg_CoH,
+    
+    CASE WHEN OTFSim.ENDING_PREDICTIVEQOH IS NULL THEN 0
+        WHEN OTFSimLagged.ENDING_PREDICTIVEQOH IS NULL 
+            THEN (OTFSim.NODEQOH + OTFSim.TOTALRECEIPT) - OTFSim.ENDING_PREDICTIVEQOH
+                ELSE (OTFSimLagged.ENDING_PREDICTIVEQOH + OTFSim.TOTALRECEIPT) - OTFSim.ENDING_PREDICTIVEQOH END as OTFSim_Met_Demand,
+    OTFSim_InventoryModel_Network.OTFSim_NetworkQoH,
+    greatest(0, Network_Forecast - OTFSim_InventoryModel_Network.OTFSim_NetworkQoH) as OTFSim_Net_Unmet,
+    COUNT_SUM_DECSIM.OTFSimBrandOrderCount,
+
+    OTFCurrent.TOTALRECEIPT as OTFCurrent_TOTALRECEIPT,
+    OTFCurrent.UNMETDEMAND as OTFCurrent_UNMETDEMAND,
+    OTFCurrent.ENDING_PREDICTIVEQOH as OTFCurrent_ENDING_PREDICTIVEQOH,
+    OTFCurrent.RFP_ITERATION_COUNT as OTFCurrent_ORDERNUMBER,
+    OTFCurrent.ORDEROTF as OTFCurrent_ORDEROTF,
+    OTFCurrent.ORDERLT as OTFCurrent_ORDERLT,
+    OTFCurrent.NEW_ORDERQTY as OTFCurrent_DOM_ORDERQTY,
+    OTFCurrent.NETWORK_DOS as OTFCurrentNETWORK_DOS,
+    OTFCurrent.DOS_ERROR_TYPE as OTFCurrent_DOS_ERROR_TYPE,
+    OTFCurrent.Total_SolCost as OTFCurrent_Total_SolCost,
+    OTFCurrent.Total_SolCost_Used as OTFCurrent_Total_SolCost_Used,
+    OTFCurrent.Total_Freight_Cost as OTFCurrent_Total_Freight_Cost,
+    OTFCurrent.SCENARIO_ADD_COST_OBSHIP as OTFCurrent_SCENARIO_ADD_COST_OBSHIP,
+    OTFCurrent.SCENARIO_OOS_LOST_MARGIN as OTFCurrent_SCENARIO_OOS_LOST_MARGIN,
+    OTFCurrent.HOLDING_COST_ADD as OTFCurrent_HOLDING_COST_ADD,
+    OTFCurrent.NETWORK_TOTALCOST as OTFCurrent_NETWORK_TOTALCOST,
+    CASE WHEN OTFCurrent.DAYSFROMTODAY = 0 THEN OTFCurrent.NODEQOH ELSE OTFCurrLagged.ENDING_PREDICTIVEQOH END * FIFO.FIFOAVERAGECOST as OTFCurrent_Beg_CoH,
+
+    CASE WHEN OTFCurrent.ENDING_PREDICTIVEQOH IS NULL THEN 0
+        WHEN OTFCurrLagged.ENDING_PREDICTIVEQOH IS NULL 
+            THEN (OTFCurrent.NODEQOH + OTFCurrent.TOTALRECEIPT) - OTFCurrent.ENDING_PREDICTIVEQOH
+                ELSE (OTFCurrLagged.ENDING_PREDICTIVEQOH + OTFCurrent.TOTALRECEIPT) - OTFCurrent.ENDING_PREDICTIVEQOH END as OTFCurrent_Met_Demand,
+    OTFCurrent_InventoryModel_Network.OTFCurrent_NetworkQoH,
+    greatest(0, Network_Forecast - OTFCurrent_InventoryModel_Network.OTFCurrent_NetworkQoH) as OTFCurrent_Net_Unmet,
+    COUNT_SUM_DECCURRENT.OTFCurrentBrandOrderCount
+                
+    
+FROM OTFSim_InventoryModel OTFSim
+LEFT JOIN OTFCurrent_InventoryModel OTFCurrent on OTFCurrent.ITEMID = OTFSim.ITEMID AND OTFCurrent.STATE = OTFSim.STATE AND OTFCurrent.DAYSFROMTODAY = OTFSim.DAYSFROMTODAY AND OTFCurrent.ORDERTYPE = OTFSim.ORDERTYPE
+
+LEFT JOIN lakehouse.spreedw_dim.product dimprod on dimprod.itemid = OTFSim.ITEMID
+LEFT JOIN LAKEHOUSE.FINANCE_COSTING.FIFOCACHE FIFO on FIFO.ITEMID = OTFSim.ITEMID
+LEFT JOIN (Select OTFSim.*, DAYSFROMTODAY + 1 as DAYSFROMTODAY_USED from OTFSim_InventoryModel OTFSim) OTFSimLagged on OTFSimLagged.ITEMID = OTFSim.ITEMID AND OTFSimLagged.STATE = OTFSim.STATE 
+    AND OTFSimLagged.DAYSFROMTODAY_USED = OTFSim.DAYSFROMTODAY
+LEFT JOIN (Select OTFCurrent.*, DAYSFROMTODAY + 1 as DAYSFROMTODAY_USED from OTFCurrent_InventoryModel OTFCurrent) OTFCurrLagged on OTFCurrLagged.ITEMID = OTFSim.ITEMID AND OTFCurrLagged.STATE = OTFSim.STATE 
+    AND OTFCurrLagged.DAYSFROMTODAY_USED = OTFSim.DAYSFROMTODAY
+LEFT JOIN OTFCurrent_InventoryModel_Network on OTFCurrent_InventoryModel_Network.ITEMID = OTFSim.ITEMID and OTFCurrent_InventoryModel_Network.DAYSFROMTODAY = OTFSim.DAYSFROMTODAY
+LEFT JOIN OTFSim_InventoryModel_Network on OTFSim_InventoryModel_Network.ITEMID = OTFSim.ITEMID and OTFSim_InventoryModel_Network.DAYSFROMTODAY = OTFSim.DAYSFROMTODAY
+LEFT JOIN COUNT_SUM_DECSIM on COUNT_SUM_DECSIM.SUPPLIERID = dimprod.SUPPLIERID AND COUNT_SUM_DECSIM.ORDERTYPE = OTFSim.ORDERTYPE 
+LEFT JOIN COUNT_SUM_DECCURRENT on COUNT_SUM_DECCURRENT.SUPPLIERID = dimprod.SUPPLIERID AND COUNT_SUM_DECCURRENT.ORDERTYPE = OTFSim.ORDERTYPE
+-- WHERE OTFSim.ITEMID = 323601
+);
+
+END
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- --Original
+
+-- With COUNT_SUM_DECSIM as (
+-- Select
+--     dimprod.SUPPLIERID,
+--     ordertype,
+--     count(dimprod.ITEMID) as OTFSimBrandOrderCount
+
+-- from inventorysandbox.dbo.RFP_OrderDecision 
+-- LEFT JOIN lakehouse.spreedw_dim.product dimprod on dimprod.itemid = RFP_OrderDecision.ITEMID
+-- Where ordertype = 'domestic'
+-- -- AND dimprod.ITEMID = 325270
+-- GROUP BY dimprod.SUPPLIERID, ordertype
+-- )
+
+-- , COUNT_SUM_DECCURRENT as (
+-- Select
+--     dimprod.SUPPLIERID,
+--     ordertype,
+--     count(dimprod.ITEMID) as OTFCurrentBrandOrderCount
+
+-- from inventorysandbox.dbo.RFP_current_OrderDecision
+-- LEFT JOIN lakehouse.spreedw_dim.product dimprod on dimprod.itemid = RFP_current_OrderDecision.ITEMID
+-- Where ordertype = 'domestic'
+-- -- AND dimprod.ITEMID = 325270
+-- GROUP BY dimprod.SUPPLIERID, ordertype
+-- )
+
+-- , NETWORK_VALUES as (
+-- Select 
+--     ITEMID,
+--     DAYSFROMTODAY,
+--     SUM(ENDING_PREDICTIVEQOH) as Original_NetworkQoH
+    
+-- from spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_HISTORY HISTORY
+-- Where GENERATEDON = current_date() --'2024-12-28'
+-- GROUP BY ITEMID, DAYSFROMTODAY
+-- )
+
+
+-- , OTFSim_InventoryModel as (
+
+--         Select InvModel.*,
+--         DEC.RFP_ITERATION_COUNT,
+--         DOS.OTF as OrderOTF,
+--         DOS.LT OrderLT,
+--         DOM_ORDERQTY,
+--         OutputDoS.ENDING_PREDICTIVEQOH as Original_QoH,
+--         OutputDoS.UNMETDEMAND as Original_Unmet,
+--         OutputDoS.TOTALRECEIPT as Original_Receipt,
+--         DOS.DAYSOFSUPPLY as Network_DoS,
+--         DEC."Total_SolCost" as TOTAL_SOLCOST,
+--         DEC."Total_SolCost_Used" as TOTAL_SOLCOST_USED,
+--         DEC."Total_Freight_Cost" as Total_Freight_Cost,
+--         DEC.SCENARIO_ADD_COST_OBSHIP,
+--         DEC.SCENARIO_OOS_LOST_MARGIN,
+--         DEC.HOLDING_COST_ADD,
+--         DEC.NETWORK_TOTALCOST,
+        
+--         CASE 
+--             WHEN DAYSOFSUPPLY >= DOS.OTF AND DAYSOFSUPPLY <= (DOS.OTF + 28) THEN 'VALID_TOTAL'
+--             WHEN ((SELECT MAX(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelDomestic_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND 
+--                 DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) <= (DOS.OTF + 28) AND (SELECT MIN(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelDomestic_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND 
+--                 DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) > 0) THEN 'VALID_FUTURE_FLOW'
+--             WHEN (DAYSOFSUPPLY > (DOS.OTF + 28) OR DAYSOFSUPPLY IS NULL) AND DOM_ORDERQTY = 0 THEN 'VALID_NO_ORDER'
+--             WHEN sim.NET_MAXQOHOTF > sim.NET_CAP AND sim.QOH_AFTER_LT > 0 AND sim.MIN_OTF_REQ <= 0.5 THEN 'VALID_CAPPED'
+--             WHEN DOS.FORECAST = 0 THEN 'VALID_NO_DEMAND'
+--             -- WHEN (DOS.TOTAL_FUTURE_FORECAST - FORECAST) < ENDING_PREDICTIVEQOH AND ENDING_PREDICTIVEQOH < (NET_CAP + FORECAST) THEN 'VALID_FINAL_ORDER'
+--             WHEN DAYSOFSUPPLY >= (DOS.OTF - 3) AND DAYSOFSUPPLY <= (DOS.OTF + 31) THEN 'ERROR_THREEDAYS'
+--             WHEN DAYSOFSUPPLY >= (DOS.OTF - 7) AND DAYSOFSUPPLY <= (DOS.OTF + 35) THEN 'ERROR_SEVENDAYS'
+--             WHEN sim.OTF_UNMET < 0.5 THEN 'ERROR_<.5UNMET'
+--             WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND DOM_ORDERQTY <= PRODUCT.CASEQUANTITY THEN 'ERROR_SINGLE_CASE_ORDERED_EXCESSDOS'
+--             WHEN sim.OTF_UNMET <= (PRODUCT.CASEQUANTITY * .75) THEN 'ERROR_<.75_CASEPACK_UNMET'
+--             WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND DOM_ORDERQTY <= 5 THEN 'ERROR_LOW_QUANTITY'
+--             WHEN (DOS.OTF + DOS.LT + 14) > 359 AND DAYSOFSUPPLY IS NULL THEN 'ERROR_TOOFEW_DAYSAVAIL'
+--             ELSE 'ERROR' 
+--         END AS DOS_ERROR_TYPE
+        
+--         from inventorysandbox.dbo.RFP_InventoryModelDomestic InvModel
+--         LEFT JOIN spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_HISTORY OutputDoS on OutputDoS.ITEMID = InvModel.ITEMID AND OutputDoS.STATE = InvModel.STATE AND OutputDoS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY 
+--             AND OutputDoS.GENERATEDON = current_date() --'2024-12-15'
+--         LEFT JOIN inventorysandbox.dbo.RFP_InventoryModelDomestic_DOS DOS on DOS.ITEMID = InvModel.ITEMID AND DOS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY
+--         LEFT JOIN (Select ITEMID, OTF, LT, MIN(NET_MAXQOHOTF) as NET_MAXQOHOTF, MIN(NET_CAP) as NET_CAP, SUM(QOH_AFTER_LT) as QOH_AFTER_LT, SUM(MIN_OTF_REQ) as MIN_OTF_REQ, SUM(OTF_UNMET) as OTF_UNMET from inventorysandbox.dbo.RFP_ordering_sim GROUP BY ITEMID, OTF, LT) sim on sim.ITEMID = DOS.ITEMID AND sim.OTF = DOS.OTF AND sim.LT = DOS.LT
+--         LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT PRODUCT ON PRODUCT.ITEMID = DOS.ITEMID
+--         LEFT JOIN inventorysandbox.dbo.RFP_OrderDecision DEC on DEC.ITEMID = InvModel.ITEMID AND DEC.FC = InvModel.STATE AND DEC.OTF = DOS.OTF AND DEC.LT = DOS.LT AND DEC.ordertype = 'domestic' 
+--         -- WHERE InvModel.ITEMID = 325270
+
+-- )
+
+-- , OTFCurrent_InventoryModel as (
+
+--     Select InvModel.*,
+--         DEC.RFP_ITERATION_COUNT,
+--         DOS.OTF as OrderOTF,
+--         DOS.LT OrderLT,
+--         DOM_ORDERQTY,
+--         OutputDoS.ENDING_PREDICTIVEQOH as Original_QoH,
+--         OutputDoS.UNMETDEMAND as Original_Unmet,
+--         OutputDoS.TOTALRECEIPT as Original_Receipt,
+--         DOS.DAYSOFSUPPLY as Network_DoS,
+--         DEC."Total_SolCost" as TOTAL_SOLCOST,
+--         DEC."Total_SolCost_Used" as TOTAL_SOLCOST_USED,
+--         DEC."Total_Freight_Cost" as Total_Freight_Cost,
+--         DEC.SCENARIO_ADD_COST_OBSHIP,
+--         DEC.SCENARIO_OOS_LOST_MARGIN,
+--         DEC.HOLDING_COST_ADD,
+--         DEC.NETWORK_TOTALCOST,
+        
+--         CASE 
+--             WHEN DAYSOFSUPPLY >= DOS.OTF AND DAYSOFSUPPLY <= (DOS.OTF + 28) THEN 'VALID_TOTAL'
+--             WHEN ((SELECT MAX(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelDomestic_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND 
+--                 DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) <= (DOS.OTF + 28) AND (SELECT MIN(DOS2.DAYSOFSUPPLY) FROM inventorysandbox.dbo.RFP_current_InventoryModelDomestic_DOS DOS2 WHERE DOS2.ITEMID = DOS.ITEMID AND 
+--                 DOS2.DAYSFROMTODAY >= DOS.DAYSFROMTODAY AND DOS2.DAYSFROMTODAY <= DOS.DAYSFROMTODAY + DOS.OTF) > 0) THEN 'VALID_FUTURE_FLOW'
+--             WHEN (DAYSOFSUPPLY > (DOS.OTF + 28) OR DAYSOFSUPPLY IS NULL) AND DOM_ORDERQTY = 0 THEN 'VALID_NO_ORDER'
+--             WHEN sim.NET_MAXQOHOTF > sim.NET_CAP AND sim.QOH_AFTER_LT > 0 AND sim.MIN_OTF_REQ <= 0.5 THEN 'VALID_CAPPED'
+--             WHEN DOS.FORECAST = 0 THEN 'VALID_NO_DEMAND'
+--             WHEN (DOS.TOTAL_FUTURE_FORECAST - DOS.FORECAST) < DOS.ENDING_PREDICTIVEQOH AND DOS.ENDING_PREDICTIVEQOH < (NET_CAP + DOS.FORECAST) THEN 'VALID_FINAL_ORDER'
+--             WHEN DAYSOFSUPPLY >= (DOS.OTF - 3) AND DAYSOFSUPPLY <= (DOS.OTF + 31) THEN 'ERROR_THREEDAYS'
+--             WHEN DAYSOFSUPPLY >= (DOS.OTF - 7) AND DAYSOFSUPPLY <= (DOS.OTF + 35) THEN 'ERROR_SEVENDAYS'
+--             WHEN sim.OTF_UNMET < 0.5 THEN 'ERROR_<.5UNMET'
+--             WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND DOM_ORDERQTY <= PRODUCT.CASEQUANTITY THEN 'ERROR_SINGLE_CASE_ORDERED_EXCESSDOS'
+--             WHEN sim.OTF_UNMET <= (PRODUCT.CASEQUANTITY * .75) THEN 'ERROR_<.75_CASEPACK_UNMET'
+--             WHEN DAYSOFSUPPLY > (DOS.OTF + 28) AND DOM_ORDERQTY <= 5 THEN 'ERROR_LOW_QUANTITY'
+--             WHEN (DOS.OTF + DOS.LT + 14) > 359 AND DAYSOFSUPPLY IS NULL THEN 'ERROR_TOOFEW_DAYSAVAIL'
+--             ELSE 'ERROR' 
+--         END AS DOS_ERROR_TYPE
+        
+--         from inventorysandbox.dbo.RFP_current_InventoryModelDomestic InvModel
+--         LEFT JOIN spreetail_warehouse.inventory.PREDICTIVEQOH_DAILY_HISTORY OutputDoS on OutputDoS.ITEMID = InvModel.ITEMID AND OutputDoS.STATE = InvModel.STATE AND OutputDoS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY
+--             AND OutputDoS.GENERATEDON = current_date() --'2024-12-15'
+--         LEFT JOIN inventorysandbox.dbo.RFP_current_InventoryModelDomestic_DOS DOS on DOS.ITEMID = InvModel.ITEMID AND DOS.DAYSFROMTODAY = InvModel.DAYSFROMTODAY
+--         LEFT JOIN (Select ITEMID, OTF, LT, MIN(NET_MAXQOHOTF) as NET_MAXQOHOTF, MIN(NET_CAP) as NET_CAP, SUM(QOH_AFTER_LT) as QOH_AFTER_LT, SUM(MIN_OTF_REQ) as MIN_OTF_REQ, SUM(OTF_UNMET) as OTF_UNMET from inventorysandbox.dbo.RFP_ordering_sim GROUP BY ITEMID, OTF, LT) sim on sim.ITEMID = DOS.ITEMID AND sim.OTF = DOS.OTF AND sim.LT = DOS.LT
+--         LEFT JOIN LAKEHOUSE.PROCUREMENT_ORDERING.PRODUCT PRODUCT ON PRODUCT.ITEMID = DOS.ITEMID
+--         LEFT JOIN inventorysandbox.dbo.RFP_current_OrderDecision DEC on DEC.ITEMID = InvModel.ITEMID AND DEC.FC = InvModel.STATE AND DEC.OTF = DOS.OTF AND DEC.LT = DOS.LT AND DEC.ordertype = 'domestic' 
+--         -- WHERE InvModel.ITEMID = 325270
+
+-- )
+
+-- , OTFCurrent_InventoryModel_Network as (
+-- Select
+--     ITEMID,
+--     DAYSFROMTODAY,
+--     SUM(ENDING_PREDICTIVEQOH) as OTFCurrent_NetworkQoH
+
+-- FROM OTFCurrent_InventoryModel
+-- GROUP BY ITEMID, DAYSFROMTODAY
+-- )
+
+-- , OTFSim_InventoryModel_Network as (
+-- Select
+--     ITEMID,
+--     DAYSFROMTODAY,
+--     SUM(ENDING_PREDICTIVEQOH) as OTFSim_NetworkQoH,
+--     SUM(FORECAST) as Network_Forecast,
+--     SUM(Original_QoH) as Original_NetworkQoH
+
+-- FROM OTFSim_InventoryModel
+-- GROUP BY ITEMID, DAYSFROMTODAY
+-- )
+
+-- Select 
+--     OTFSim.PARTNUMBER,
+--     OTFSim.ITEMID,
+--     dimprod.supplierid,
+--     OTFSim.STATE,
+--     OTFSim.DAYSFROMTODAY,
+--     OTFSim.NODEQOH,
+--     OTFSim.FORECAST,
+--     OTFSim.ORIGINAL_QOH,
+--     OTFSim.ORIGINAL_UNMET,
+--     OTFSim.ORIGINAL_RECEIPT,
+--     current_date() + OTFSim.DAYSFROMTODAY as DATEVALUE,
+--     RANK() OVER (PARTITION BY dimprod.supplierid ORDER BY OTFSim.ITEMID) AS Item_Brand_Rank,
+--     Network_Forecast,
+--     Original_NetworkQoH,
+--     greatest(0, Network_Forecast - Original_NetworkQoH) as Original_Net_Unmet,
+
+--     OTFSim.TOTALRECEIPT as OTFSim_TOTALRECEIPT,
+--     OTFSim.UNMETDEMAND as OTFSim_UNMETDEMAND,
+--     OTFSim.ENDING_PREDICTIVEQOH as OTFSim_ENDING_PREDICTIVEQOH,
+--     OTFSim.RFP_ITERATION_COUNT as OTFSim_ORDERNUMBER,
+--     OTFSim.ORDEROTF as OTFSim_ORDEROTF,
+--     OTFSim.ORDERLT as OTFSim_ORDERLT,
+--     OTFSim.DOM_ORDERQTY as OTFSim_DOM_ORDERQTY,
+--     OTFSim.NETWORK_DOS as OTFSim_NETWORK_DOS,
+--     OTFSim.DOS_ERROR_TYPE as OTFSim_DOS_ERROR_TYPE,
+--     OTFSim.Total_SolCost as OTFSim_Total_SolCost,
+--     OTFSim.Total_SolCost_Used as OTFSim_Total_SolCost_Used,
+--     OTFSim.Total_Freight_Cost as OTFSim_Total_Freight_Cost,
+--     OTFSim.SCENARIO_ADD_COST_OBSHIP as OTFSim_SCENARIO_ADD_COST_OBSHIP,
+--     OTFSim.SCENARIO_OOS_LOST_MARGIN as OTFSim_SCENARIO_OOS_LOST_MARGIN,
+--     OTFSim.HOLDING_COST_ADD as OTFSim_HOLDING_COST_ADD,
+--     OTFSim.NETWORK_TOTALCOST as OTFSim_NETWORK_TOTALCOST,
+--     CASE WHEN OTFSim.DAYSFROMTODAY = 0 THEN OTFSim.NODEQOH ELSE OTFSimLagged.ENDING_PREDICTIVEQOH END * FIFO.FIFOAVERAGECOST as OTFSim_Beg_CoH,
+    
+--     CASE WHEN OTFSim.ENDING_PREDICTIVEQOH IS NULL THEN 0
+--         WHEN OTFSimLagged.ENDING_PREDICTIVEQOH IS NULL 
+--             THEN (OTFSim.NODEQOH + OTFSim.TOTALRECEIPT) - OTFSim.ENDING_PREDICTIVEQOH
+--                 ELSE (OTFSimLagged.ENDING_PREDICTIVEQOH + OTFSim.TOTALRECEIPT) - OTFSim.ENDING_PREDICTIVEQOH END as OTFSim_Met_Demand,
+--     OTFSim_InventoryModel_Network.OTFSim_NetworkQoH,
+--     greatest(0, Network_Forecast - OTFSim_InventoryModel_Network.OTFSim_NetworkQoH) as OTFSim_Net_Unmet,
+--     COUNT_SUM_DECSIM.OTFSimBrandOrderCount,
+
+--     OTFCurrent.TOTALRECEIPT as OTFCurrent_TOTALRECEIPT,
+--     OTFCurrent.UNMETDEMAND as OTFCurrent_UNMETDEMAND,
+--     OTFCurrent.ENDING_PREDICTIVEQOH as OTFCurrent_ENDING_PREDICTIVEQOH,
+--     OTFCurrent.RFP_ITERATION_COUNT as OTFCurrent_ORDERNUMBER,
+--     OTFCurrent.ORDEROTF as OTFCurrent_ORDEROTF,
+--     OTFCurrent.ORDERLT as OTFCurrent_ORDERLT,
+--     OTFCurrent.DOM_ORDERQTY as OTFCurrent_DOM_ORDERQTY,
+--     OTFCurrent.NETWORK_DOS as OTFCurrentNETWORK_DOS,
+--     OTFCurrent.DOS_ERROR_TYPE as OTFCurrent_DOS_ERROR_TYPE,
+--     OTFCurrent.Total_SolCost as OTFCurrent_Total_SolCost,
+--     OTFCurrent.Total_SolCost_Used as OTFCurrent_Total_SolCost_Used,
+--     OTFCurrent.Total_Freight_Cost as OTFCurrent_Total_Freight_Cost,
+--     OTFCurrent.SCENARIO_ADD_COST_OBSHIP as OTFCurrent_SCENARIO_ADD_COST_OBSHIP,
+--     OTFCurrent.SCENARIO_OOS_LOST_MARGIN as OTFCurrent_SCENARIO_OOS_LOST_MARGIN,
+--     OTFCurrent.HOLDING_COST_ADD as OTFCurrent_HOLDING_COST_ADD,
+--     OTFCurrent.NETWORK_TOTALCOST as OTFCurrent_NETWORK_TOTALCOST,
+--     CASE WHEN OTFCurrent.DAYSFROMTODAY = 0 THEN OTFCurrent.NODEQOH ELSE OTFCurrLagged.ENDING_PREDICTIVEQOH END * FIFO.FIFOAVERAGECOST as OTFCurrent_Beg_CoH,
+
+--     CASE WHEN OTFCurrent.ENDING_PREDICTIVEQOH IS NULL THEN 0
+--         WHEN OTFCurrLagged.ENDING_PREDICTIVEQOH IS NULL 
+--             THEN (OTFCurrent.NODEQOH + OTFCurrent.TOTALRECEIPT) - OTFCurrent.ENDING_PREDICTIVEQOH
+--                 ELSE (OTFCurrLagged.ENDING_PREDICTIVEQOH + OTFCurrent.TOTALRECEIPT) - OTFCurrent.ENDING_PREDICTIVEQOH END as OTFCurrent_Met_Demand,
+--     OTFCurrent_InventoryModel_Network.OTFCurrent_NetworkQoH,
+--     greatest(0, Network_Forecast - OTFCurrent_InventoryModel_Network.OTFCurrent_NetworkQoH) as OTFCurrent_Net_Unmet,
+--     COUNT_SUM_DECCURRENT.OTFCurrentBrandOrderCount
+                
+    
+-- FROM OTFSim_InventoryModel OTFSim
+-- LEFT JOIN OTFCurrent_InventoryModel OTFCurrent on OTFCurrent.ITEMID = OTFSim.ITEMID AND OTFCurrent.STATE = OTFSim.STATE AND OTFCurrent.DAYSFROMTODAY = OTFSim.DAYSFROMTODAY
+
+-- LEFT JOIN lakehouse.spreedw_dim.product dimprod on dimprod.itemid = OTFSim.ITEMID
+-- LEFT JOIN LAKEHOUSE.FINANCE_COSTING.FIFOCACHE FIFO on FIFO.ITEMID = OTFSim.ITEMID
+-- LEFT JOIN (Select OTFSim.*, DAYSFROMTODAY + 1 as DAYSFROMTODAY_USED from OTFSim_InventoryModel OTFSim) OTFSimLagged on OTFSimLagged.ITEMID = OTFSim.ITEMID AND OTFSimLagged.STATE = OTFSim.STATE 
+--     AND OTFSimLagged.DAYSFROMTODAY_USED = OTFSim.DAYSFROMTODAY
+-- LEFT JOIN (Select OTFCurrent.*, DAYSFROMTODAY + 1 as DAYSFROMTODAY_USED from OTFCurrent_InventoryModel OTFCurrent) OTFCurrLagged on OTFCurrLagged.ITEMID = OTFSim.ITEMID AND OTFCurrLagged.STATE = OTFSim.STATE 
+--     AND OTFCurrLagged.DAYSFROMTODAY_USED = OTFSim.DAYSFROMTODAY
+-- LEFT JOIN OTFCurrent_InventoryModel_Network on OTFCurrent_InventoryModel_Network.ITEMID = OTFSim.ITEMID and OTFCurrent_InventoryModel_Network.DAYSFROMTODAY = OTFSim.DAYSFROMTODAY
+-- LEFT JOIN OTFSim_InventoryModel_Network on OTFSim_InventoryModel_Network.ITEMID = OTFSim.ITEMID and OTFSim_InventoryModel_Network.DAYSFROMTODAY = OTFSim.DAYSFROMTODAY
+-- LEFT JOIN COUNT_SUM_DECSIM on COUNT_SUM_DECSIM.SUPPLIERID = dimprod.SUPPLIERID AND COUNT_SUM_DECSIM.ordertype = 'domestic'
+-- LEFT JOIN COUNT_SUM_DECCURRENT on COUNT_SUM_DECCURRENT.SUPPLIERID = dimprod.SUPPLIERID AND COUNT_SUM_DECCURRENT.ordertype = 'domestic'
