@@ -1,0 +1,168 @@
+--UPDATE FROM TESTING -> CHANGE ALL .DBO to .DBO
+--DIFFERENCES FROM CURRENT:
+    --_Current to _Simulation
+
+CREATE OR REPLACE TABLE INVENTORYSANDBOX.DBO.RFP_SIMULATION_ORDERDECISION
+(
+    ITEMID                           VARCHAR(50),
+    SUPPLIERID                       VARCHAR(50),
+    FC                               VARCHAR(50),
+    FC_CODE                          VARCHAR(50),
+    ORDERTYPE                        VARCHAR(50),
+    UPDATED_ORDERTYPE                VARCHAR(50),
+    OTF                              NUMBER(38,0),
+    LT                               NUMBER(38,0),
+    CAP_DOS                          NUMBER(38,2),
+    Output_Original                  NUMBER(38,2),
+    Output_OriginalCost              NUMBER(38,2),
+    FC_Limited                       NUMBER(38,2),
+    Redistribution_Qty               NUMBER(38,2),
+    Output_Redistributed             NUMBER(38,2),
+    Output_RedistributedCost         NUMBER(38,2),
+    CASEQUANTITY                     NUMBER(38,2),
+    ITEMCUBE                         NUMBER(38,2),
+    FIFOAVERAGECOST                  NUMBER(38,2),
+    Item_Constraint_Used             VARCHAR(50),
+    Item_MOQMOV_Type                 VARCHAR(50),
+    Redistribution_Qty_ItemMOQ       NUMBER(38,2),
+    Constraint_Total_Applicable      VARCHAR(50),
+    Roundup_ItemMOQ                  NUMBER(38,2),
+    Output_OrderQty_ItemMOQ          NUMBER(38,2),
+    Output_OrderCost_ItemMOQ         NUMBER(38,2),
+    Case_RoundType                   VARCHAR(50),
+    Output_CaseRoundQty              NUMBER(38,2),
+    Output_CaseRoundCost             NUMBER(38,2),
+    Item_Pallet_Type                 VARCHAR(50),
+    Item_Pallet_Constraint           VARCHAR(50),
+    Item_Pallet_TotalRound           NUMBER(38,2),
+    Output_ItemPalletQty             NUMBER(38,2),
+    Output_ItemPalletCost            NUMBER(38,2),
+    Brand_MOV_Type                   VARCHAR(50),
+    Brand_MOV_Used                   VARCHAR(50),
+    MOV_RoundUnits                   NUMBER(38,2),
+    MOV_ReqRoundAdd_Pallet           NUMBER(38,2),
+    Output_BrandMOVQty               NUMBER(38,2),
+    Output_BrandMOVCost              NUMBER(38,2),
+    BRAND_CUBEWEIGHTUNIT_TYPE        VARCHAR(50),
+    BRANDCUBE_TARGET                 NUMBER(38,2),
+    FC_COMBO_ORDERED                 VARCHAR(50),
+    FC_COUNT                         NUMBER(38,0),
+    FC_COMBO_OPTION                  VARCHAR(50),
+    FC_COUNT_OPTION                  NUMBER(38,0),
+    TOTAL_CUBE_NETWORK               NUMBER(38,2),
+    ORIGIN                           VARCHAR(50),
+    Total_Freight_Cost               NUMBER(38,2),
+    SCENARIO_ADD_COST_OBSHIP         NUMBER(38,2),
+    NETWORK_TOTALCOST                NUMBER(38,2),
+    SCENARIO_OOS_LOST_MARGIN         NUMBER(38,2),
+    HOLDING_COST_ADD                 NUMBER(38,2),
+    Total_SolCost                    NUMBER(38,2),
+    Total_SolCost_Used               NUMBER(38,2),
+    RFP_ITERATION_COUNT              NUMBER(38,0),
+    Output_FreightOptQty             NUMBER(38,2),
+    Output_FreightOptCost            NUMBER(38,2),
+    Output_FreightOptCube            NUMBER(38,2),
+    FrghtOpt_FCRedist_To             VARCHAR(50),
+    "Last Modified"                  TIMESTAMP_NTZ
+);
+
+
+create or replace table INVENTORYSANDBOX.DBO.ER_TEMP_OTF_RFP as (
+Select * from INVENTORYSANDBOX.DBO.ER_TEMP_OTF_RFP
+);
+
+
+
+CREATE OR REPLACE TABLE INVENTORYSANDBOX.DBO.RFP_SIMULATION_IB_OPTIMIZATION
+(
+    ITEMID                          NUMBER(38,0),        -- e.g. 412591
+    SUPPLIERID                      NUMBER(38,0),        -- e.g. 4318
+    FC                              VARCHAR(50),         -- e.g. 'NV'
+    FC_CODE                         VARCHAR(50),         -- e.g. 'LAS'
+    ORDERTYPE                       VARCHAR(50),         -- e.g. 'import'
+    OTF                             NUMBER(38,0),        -- e.g. 35
+    LT                              NUMBER(38,0),        -- e.g. 140
+    CAP_DOS                         NUMBER(38,0),        -- e.g. 35
+    ITERATION_COUNT                 NUMBER(38,0),        -- e.g. 1
+    RFP_ITERATION_COUNT             NUMBER(38,0),        -- e.g. 1
+
+    Output_Original                 NUMBER(38,0),        -- e.g. 56
+    Output_OriginalCost             NUMBER(38,4),        -- e.g. 18.5416
+    FC_Limited                      NUMBER(38,0),        -- e.g. 0
+    Redistribution_Qty              NUMBER(38,0),        -- e.g. 0
+    Output_Redistributed            NUMBER(38,0),        -- e.g. 56
+    Output_RedistributedCost        NUMBER(38,4),        -- e.g. 18.5416
+
+    CASEQUANTITY                    NUMBER(38,0),        -- e.g. 1
+    ITEMCUBE                        NUMBER(38,4),        -- e.g. 1.9127
+    FIFOAVERAGECOST                 NUMBER(38,4),        -- e.g. 0.3311
+    Item_Constraint_Used            NUMBER(38,0),        -- e.g. 0
+    Item_MOQMOV_Type                VARCHAR(50),         -- e.g. ''
+    Redistribution_Qty_ItemMOQ      NUMBER(38,0),        -- e.g. -56
+    Constraint_Total_Applicable     NUMBER(38,0),        -- e.g. 0
+    Roundup_ItemMOQ                 NUMBER(38,0),        -- e.g. 0
+    Output_OrderQty_ItemMOQ         NUMBER(38,0),        -- e.g. 56
+    Output_OrderCost_ItemMOQ        NUMBER(38,4),        -- e.g. 18.54
+
+    Case_RoundType                  VARCHAR(50),         -- e.g. 'Round'
+    Output_CaseRoundQty             NUMBER(38,0),        -- e.g. 56
+    Output_CaseRoundCost            NUMBER(38,4),        -- e.g. 18.5416
+
+    Item_Pallet_Type                VARCHAR(50),         -- e.g. ''
+    Item_Pallet_Constraint          NUMBER(38,0),        -- e.g. 56
+    Item_Pallet_TotalRound          NUMBER(38,0),        -- e.g. 0
+    Output_ItemPalletQty            NUMBER(38,0),        -- e.g. 56
+    Output_ItemPalletCost           NUMBER(38,4),        -- e.g. 18.5416
+
+    Brand_MOV_Type                  VARCHAR(50),         -- e.g. 'None'
+    Brand_MOV_Used                  NUMBER(38,0),        -- e.g. 0
+    MOV_RoundUnits                  NUMBER(38,0),        -- e.g. 0
+    MOV_ReqRoundAdd_Pallet          NUMBER(38,0),        -- e.g. 0
+    Output_BrandMOVQty              NUMBER(38,0),        -- e.g. 56
+    Output_BrandMOVCost             NUMBER(38,4),        -- e.g. 18.5416
+
+    FC_COUNT                        NUMBER(38,0),        -- e.g. NULL or integer
+    FC_COMBO_OPTION                 VARCHAR(50),         -- e.g. NULL
+    FC_COUNT_OPTION                 NUMBER(38,0),        -- e.g. NULL
+    TOTAL_CUBE_NETWORK              NUMBER(38,4),        -- e.g. NULL
+    ORIGIN                          VARCHAR(50),         -- e.g. NULL
+    Total_Freight_Cost              NUMBER(38,4),        -- e.g. NULL
+    SCENARIO_ADD_COST_OBSHIP        NUMBER(38,4),        -- e.g. NULL
+    NETWORK_TOTALCOST               NUMBER(38,4),        -- e.g. NULL
+    SCENARIO_OOS_LOST_MARGIN        NUMBER(38,4),        -- e.g. NULL
+    HOLDING_COST_ADD                NUMBER(38,4),        -- e.g. NULL
+    Total_SolCost                   NUMBER(38,4),        -- e.g. NULL
+    Total_SolCost_Used              NUMBER(38,4),        -- e.g. NULL
+
+    Output_FreightOptQty            NUMBER(38,0),        -- e.g. NULL
+    Output_FreightOptCost           NUMBER(38,4),        -- e.g. NULL
+    Output_FreightOptCube           NUMBER(38,4),        -- e.g. NULL
+    FrghtOpt_FCRedist_To            VARCHAR(50),         -- e.g. NULL
+
+    "Last Modified"                 TIMESTAMP_NTZ        -- e.g. '2025-01-23 01:59:07'
+);
+
+
+CREATE OR REPLACE TABLE INVENTORYSANDBOX.DBO.RFP_SIMULATION_PREDICTEDQOHV2
+(
+    ITEMID                NUMBER(38,0),    -- e.g. 68372
+    DATEVALUE             DATE,            -- e.g. '1/23/2025'
+    FC                    VARCHAR(50),     -- e.g. 'WA'
+    UPDATED_ORDERTYPE     VARCHAR(50),     -- e.g. 'domestic'
+    ORDERTYPE             VARCHAR(50),     -- e.g. 'domestic'
+    LT_DATE               DATE,            -- e.g. '12/3/2025'
+    OTF_DATE              DATE,            -- e.g. '12/24/2025'
+    OUTPUT_FREIGHTOPTQTY  NUMBER(38,0),    -- e.g. 0
+    DAYSFROMTODAY         NUMBER(38,0),    -- e.g. 0
+    NODEQOH               NUMBER(38,0),    -- e.g. 68
+    QOO                   NUMBER(38,0),    -- e.g. 0
+    FORECAST              NUMBER(38,5),    -- e.g. 2.31745
+    FINAL_FORECAST_USED   NUMBER(38,5),    -- e.g. 2.31745
+    ENDING_PREDICTIVEQOH  NUMBER(38,0),    -- e.g. 66
+    UNMETDEMAND           NUMBER(38,0),    -- e.g. 0
+    CUMULATIVE_UNMET      NUMBER(38,0),    -- e.g. 0
+    ORDERQTY_REMAINING    NUMBER(38,0),    -- e.g. 0
+    UPDATED_UNMET         NUMBER(38,0),    -- e.g. 0
+    PREDICTEDQOH          NUMBER(38,0),    -- e.g. 66
+    RFP_ITERATION_COUNT   NUMBER(38,0)     -- e.g. 43
+);
