@@ -1,0 +1,31 @@
+CREATE OR REPLACE PROCEDURE INVENTORYSANDBOX.DBO.AOG_Iteration_Test_Simulation()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    var maxIterationCount;
+
+    // Query to fetch the maximum RFP iteration count
+    var sqlQuery = `SELECT MAX(RFP_ITERATION_COUNT) AS MAX_ITERATION_COUNT 
+                    FROM inventorysandbox.dbo.RFP_Simulation_OrderDecision`;
+
+    // Execute the query
+    var statement = snowflake.createStatement({sqlText: sqlQuery});
+    var resultSet = statement.execute();
+    if (resultSet.next()) {
+        maxIterationCount = resultSet.getColumnValue(1);
+    } else {
+        throw "Failed to retrieve MAX RFP_ITERATION_COUNT";
+    }
+
+    // Check the condition
+    if (maxIterationCount > 10) {
+        // Call the updated procedure
+        snowflake.createStatement({sqlText: 'execute task INVENTORYSANDBOX.DBO.Step_7A_RFPGen_Simulation'}).execute();
+        return 'Final Procedure executed successfully.';
+    } else {
+        // Call the original procedure
+        snowflake.createStatement({sqlText: 'execute task INVENTORYSANDBOX.DBO.AOG_Orch_Simulation'}).execute();
+        return 'Procedure executed successfully.';
+    }
+$$;
