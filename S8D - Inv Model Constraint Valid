@@ -1,0 +1,113 @@
+#Python Code Created by: Erik R
+#Code Last Updated: 1/6/2025
+#Code Guide Avail Here: 
+#Code Name: Step_8D_RFPGen_Simulation
+
+
+#Update Notes:
+#Ability to live connect to excel sheet for constraint data
+
+import snowflake.snowpark as snowpark
+import numpy as np
+import pandas as pd
+import random
+from snowflake.snowpark.functions import col
+from datetime import *
+
+def main(session: snowpark.Session): 
+#Adjust Warehouse Size
+    #update_command = "ALTER WAREHOUSE IBOPTIMIZATION_WH SET WAREHOUSE_SIZE = 'XLARGE'"
+    #session.sql(update_command).collect()
+
+#Gather Order Information from Step 7 of IB Opt.
+    InputData = 'inventorysandbox.dbo.RFP_IB_optimization'
+        #Create & Filter Output (Item or Brand Options)
+    #df_InputData = session.table(InputData).filter(col("ITEMID") == '171463')
+    df_InputData = session.table(InputData)#.filter(col("ITEMID") == '399478')
+        #Covert to Pandas
+    df_InputData = df_InputData.to_pandas()
+
+#Redist Valid - 0 errors as of 7/19/24
+    df_InputData['Redist_Valid'] = np.where((df_InputData['FC_Limited'] == 1) & (df_InputData['Output_BrandMOVQty'] > 0), 'No', 'Yes')
+
+#Item MOQ / MOV Valid - 64 errors as of 7/19/24
+    df_InputData['Item_MOQV_Network_Qty'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_BrandMOVQty'].transform('sum')
+    df_InputData['Item_MOQV_Network_Cost'] = df_InputData.groupby(['ITEMID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_BrandMOVCost'].transform('sum')
+    
+    df_InputData['Item_MOQV_Used'] = np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Mast', df_InputData['Item_MOQV_Network_Qty'],
+                                              np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Mast', df_InputData['Item_MOQV_Network_Cost'],
+                                                       np.where(df_InputData['Item_MOQMOV_Type'] == 'MOQ, Per Ship', df_InputData['Output_BrandMOVQty'],
+                                                                np.where(df_InputData['Item_MOQMOV_Type'] == 'MOV, Per Ship', df_InputData['Output_BrandMOVCost'], 0))))
+    
+    df_InputData['Item_MOQV_Valid'] = np.where(df_InputData['Item_MOQV_Used'] == 0, 'Yes',
+                                               np.where(df_InputData['Item_MOQV_Used'] < df_InputData['Item_Constraint_Used'], 'No', 'Yes'))
+    df_InputData = df_InputData.drop(columns=['Item_MOQV_Network_Qty', 'Item_MOQV_Network_Cost', 'Item_MOQV_Used'])
+
+#Case Valid - 241 errors as of 7/19/24
+    def mround(x, base):
+        if base == 0:
+            return 0
+        else:
+            return base * np.round(x / base)
+    df_InputData['CaseQty_Valid'] = np.where(df_InputData['Output_BrandMOVQty'] != df_InputData.apply(lambda row: mround(row['Output_BrandMOVQty'], row['CASEQUANTITY']), axis=1), 'No', 'Yes')
+    #df_InputData['CaseQty_Test'] = df_InputData.apply(lambda row: mround(row['Output_BrandMOVQty'], row['CASEQUANTITY']), axis=1)
+
+#Item Pallet Valid 
+    df_InputData['Item_Pallet_Constraint'].fillna(1, inplace=True)
+    df_InputData['Item_Pallet_Constraint'] = np.where(df_InputData['Item_Pallet_Constraint'] == 0, 1, df_InputData['Item_Pallet_Constraint'])
+    df_InputData['Item_Pallet_Valid'] = np.where(df_InputData['Item_Pallet_Type'] != '"Req"', 'Yes',
+                                                 np.where(df_InputData['Output_BrandMOVQty'] != df_InputData.apply(lambda row: mround(row['Output_BrandMOVQty'], row['Item_Pallet_Constraint']), axis=1), 'No', 'Yes'))
+
+#Brand MOV Valid
+    df_InputData['Brand_MOV_Total'] = np.where(df_InputData['Brand_MOV_Type'] == 'Ship', df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_BrandMOVCost'].transform('sum'),
+                                               np.where(df_InputData['Brand_MOV_Type'] == 'Mast', df_InputData.groupby(['SUPPLIERID', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_BrandMOVCost'].transform('sum'), 999999))
+    df_InputData['Brand_MOV_Valid'] = np.where((df_InputData['Brand_MOV_Total'] < df_InputData['Brand_MOV_Used']) & (df_InputData['Brand_MOV_Total'] > 0), 'No', 'Yes')
+    df_InputData = df_InputData.drop(columns=['Brand_MOV_Total'])
+    
+# #Brand Pallet Valid
+#     df_InputData['Output_Pallet_Count'] = np.where(df_InputData['Brand_Pallet_Constraint'] > 0, df_InputData['Output_BrandMOVQty'] / df_InputData['Item_Pallet_Constraint'], 0)
+#     df_InputData['Brand_Pallet_TotalV2'] = df_InputData.groupby(['SUPPLIERID', 'FC', 'ORDERTYPE', 'OTF', 'LT', 'CAP_DOS'])['Output_Pallet_Count'].transform('sum')
+#     df_InputData['Brand_Pallet_Valid'] = np.where(df_InputData['Brand_Pallet_TotalV2'] != df_InputData.apply(lambda row: mround(row['Brand_Pallet_TotalV2'], row['Brand_Pallet_Constraint']), axis=1), 'No', 'Yes')
+#     df_InputData = df_InputData.drop(columns=['Output_Pallet_Count', 'Brand_Pallet_TotalV2'])
+                                                   
+# #Brand Weight/Cube/Unit Valid
+#     def rounddown(x, base):
+#         if base == 0:
+#             return 0
+#         else:
+#             return base * np.floor(x / base)
+    
+#     df_InputData['Min_Round'] = df_InputData.apply(lambda row: rounddown(row['Output_BrandCubeConstraint_FC'], row['BrandCube_Constraint_Lower']), axis=1) / df_InputData['BrandCube_Constraint_Lower']
+#     df_InputData['Max_Round'] = df_InputData.apply(lambda row: rounddown(row['Output_BrandCubeConstraint_FC'], row['BrandCube_Constraint_Upper']), axis=1) / df_InputData['BrandCube_Constraint_Upper']
+
+#         #Added 8/9/2024 to accept variance of less than 1% from target constraint
+#     df_InputData['OnePercentLower'] = df_InputData.apply(lambda row: mround(row['Output_BrandCubeConstraint_FC'], row['BrandCube_Constraint_Lower']), axis=1)
+#     df_InputData['OnePercentUpper'] = df_InputData.apply(lambda row: mround(row['Output_BrandCubeConstraint_FC'], row['BrandCube_Constraint_Upper']), axis=1)
+#     df_InputData['OnePercentVar'] = np.where((df_InputData['BrandCube_Constraint_Lower'] == 0) | (df_InputData['BrandCube_Constraint_Lower'] == 0), 'Yes',
+#                                              np.where((df_InputData['OnePercentLower'] == 0) | (df_InputData['OnePercentUpper'] == 0), 'No',
+#                                                       np.where((np.abs(df_InputData['OnePercentLower'] - df_InputData['Output_BrandCubeConstraint_FC']) / df_InputData['BrandCube_Constraint_Lower']) < .01, 'Yes',
+#                                                                np.where((np.abs(df_InputData['OnePercentUpper'] - df_InputData['Output_BrandCubeConstraint_FC']) / df_InputData['BrandCube_Constraint_Upper']) < .01, 'Yes', 'No'))))
+    
+#     df_InputData['Brand_CubeWeightUnit_Valid'] = np.where(df_InputData['Output_BrandCubeConstraint_FC'] == 0, 'Yes',
+#                                                           np.where(df_InputData['OnePercentVar'] == 'Yes', 'Yes',
+#                                                                    np.where(df_InputData['Min_Round'] == df_InputData['Max_Round'], 'No', 'Yes')))
+#     df_InputData = df_InputData.drop(columns=['Min_Round', 'Max_Round', 'OnePercentLower', 'OnePercentUpper', 'OnePercentVar'])
+    
+#Final Error Grouping
+    df_InputData['All_Valid'] = np.where((df_InputData['Redist_Valid'] == 'No') | (df_InputData['Item_MOQV_Valid'] == 'No') | (df_InputData['CaseQty_Valid'] == 'No') | (df_InputData['Item_Pallet_Valid'] == 'No') | (df_InputData['Brand_MOV_Valid'] == 'No'), 'No', 'Yes')
+
+#Add FC Combo to be used in Freight Optimizer
+    #df_InputData['FC_COMBO_ORDERED'] = 
+    #df_InputData['FC_COMBO_COUNT_ORDERED']
+    
+#Generate Output Table
+    session.create_dataframe(df_InputData).write.mode("overwrite").saveAsTable('inventorysandbox.dbo.RFP_InventoryModelOpt_Validation')
+
+#Optional - View Output   
+    # df_InputData = session.create_dataframe(df_InputData)
+    # return df_InputData#.filter(col("SUPPLIERID") == '733');
+    #return df_InputData.filter(col("ITEMID") == '399478'); 
+    #return df_InputData.filter(col("Item_Pallet_Type") == '"Req"');
+
+#to avoid error
+    return(session.create_dataframe([1]))
